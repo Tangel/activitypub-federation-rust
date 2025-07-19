@@ -28,7 +28,7 @@ use crate::{
     config::Data,
     error::Error,
     fetch::object_id::ObjectId,
-    traits::{ActivityHandler, Actor, Object},
+    traits::{Activity, Actor, Object},
 };
 pub use activitystreams_kinds as kinds;
 pub use serde_json;
@@ -41,25 +41,22 @@ pub const FEDERATION_CONTENT_TYPE: &str = "application/activity+json";
 
 /// Deserialize incoming inbox activity to the given type, perform basic
 /// validation and extract the actor.
-async fn parse_received_activity<Activity, ActorT, Datatype>(
+async fn parse_received_activity<A, ActorT, Datatype>(
     body: &[u8],
     data: &Data<Datatype>,
-) -> Result<(Activity, ActorT), <Activity as ActivityHandler>::Error>
+) -> Result<(A, ActorT), <A as Activity>::Error>
 where
-    Activity: ActivityHandler<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
     ActorT: Object<DataType = Datatype> + Actor + Send + 'static,
     for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
-    <Activity as ActivityHandler>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
     <ActorT as Object>::Error: From<Error>,
     Datatype: Clone,
 {
-    let activity: Activity = serde_json::from_slice(body).map_err(|_| {
+    let activity: A = serde_json::from_slice(body).map_err(|err| {
         // Attempt to include activity id in error message
-        use serde::de::Error as _;
         let id = extract_id(body).ok();
-        let v = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
-        let e = serde_json::Error::custom(v);
-        Error::ParseReceivedActivity(e, id)
+        Error::ParseReceivedActivity { err, id }
     })?;
     data.config.verify_url_and_domain(&activity).await?;
     let actor = ObjectId::<ActorT>::from(activity.actor().clone())
