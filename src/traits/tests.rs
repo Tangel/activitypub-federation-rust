@@ -4,7 +4,7 @@
 //!
 //! TODO: Should be using `cfg[doctest]` but blocked by <https://github.com/rust-lang/rust/issues/67295>
 
-use super::{async_trait, Activity, Actor, Data, Debug, Object, PublicKey, Url};
+use super::{Activity, Actor, Data, Debug, Object, PublicKey, Url};
 use crate::{
     error::Error,
     fetch::object_id::ObjectId,
@@ -67,7 +67,6 @@ pub static DB_USER: LazyLock<DbUser> = LazyLock::new(|| DbUser {
     local: false,
 });
 
-#[async_trait]
 impl Object for DbUser {
     type DataType = DbConnection;
     type Kind = Person;
@@ -143,7 +142,6 @@ pub struct Follow {
     pub id: Url,
 }
 
-#[async_trait]
 impl Activity for Follow {
     type DataType = DbConnection;
     type Error = Error;
@@ -173,7 +171,6 @@ pub struct DbPost {
     pub federation_id: Url,
 }
 
-#[async_trait]
 impl Object for DbPost {
     type DataType = DbConnection;
     type Kind = Note;

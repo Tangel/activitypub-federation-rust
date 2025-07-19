@@ -1,7 +1,8 @@
 //! Traits which need to be implemented for federated data types
 
+#![allow(async_fn_in_trait)]
+
 use crate::{config::Data, protocol::public_key::PublicKey};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::{fmt::Debug, ops::Deref};
@@ -99,7 +100,6 @@ pub mod tests;
 ///     }
 ///
 /// }
-#[async_trait]
 pub trait Object: Sized + Debug {
     /// App data type passed to handlers. Must be identical to
     /// [crate::config::FederationConfigBuilder::app_data] type.
@@ -249,8 +249,6 @@ pub trait Object: Sized + Debug {
 ///     }
 /// }
 /// ```
-#[async_trait]
-#[enum_delegate::register]
 pub trait Activity {
     /// App data type passed to handlers. Must be identical to
     /// [crate::config::FederationConfigBuilder::app_data] type.
@@ -311,7 +309,6 @@ pub trait Actor: Object + Send + 'static {
 }
 
 /// Allow for boxing of enum variants
-#[async_trait]
 impl<T> Activity for Box<T>
 where
     T: Activity + Send + Sync,
@@ -337,7 +334,6 @@ where
 }
 
 /// Trait for federating collections
-#[async_trait]
 pub trait Collection: Sized {
     /// Actor or object that this collection belongs to
     type Owner;

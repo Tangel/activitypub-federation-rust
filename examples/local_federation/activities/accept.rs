@@ -29,7 +29,6 @@ impl Accept {
     }
 }
 
-#[async_trait::async_trait]
 impl Activity for Accept {
     type DataType = DatabaseHandle;
     type Error = crate::error::Error;

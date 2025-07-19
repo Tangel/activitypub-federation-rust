@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct DbPost {
     pub text: String,
     pub ap_id: ObjectId<DbPost>,
@@ -41,7 +42,6 @@ pub struct Note {
     content: String,
 }
 
-#[async_trait::async_trait]
 impl Object for DbPost {
     type DataType = DatabaseHandle;
     type Kind = Note;

@@ -49,7 +49,6 @@ impl CreatePost {
     }
 }
 
-#[async_trait::async_trait]
 impl Activity for CreatePost {
     type DataType = DatabaseHandle;
     type Error = crate::error::Error;

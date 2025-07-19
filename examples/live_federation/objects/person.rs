@@ -13,6 +13,7 @@ use std::fmt::Debug;
 use url::Url;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DbUser {
     pub name: String,
     pub ap_id: ObjectId<DbUser>,
@@ -29,9 +30,37 @@ pub struct DbUser {
 /// List of all activities which this actor can receive.
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(untagged)]
-#[enum_delegate::implement(Activity)]
 pub enum PersonAcceptedActivities {
     CreateNote(CreatePost),
+}
+
+impl Activity for PersonAcceptedActivities {
+    type DataType = DatabaseHandle;
+    type Error = crate::error::Error;
+
+    fn id(&self) -> &Url {
+        match self {
+            Self::CreateNote(inner) => inner.id(),
+        }
+    }
+
+    fn actor(&self) -> &Url {
+        match self {
+            Self::CreateNote(inner) => inner.actor(),
+        }
+    }
+
+    async fn verify(&self, data: &Data<Self::DataType>) -> Result<(), Self::Error> {
+        match self {
+            Self::CreateNote(inner) => inner.verify(data).await,
+        }
+    }
+
+    async fn receive(self, data: &Data<Self::DataType>) -> Result<(), Self::Error> {
+        match self {
+            Self::CreateNote(inner) => inner.receive(data).await,
+        }
+    }
 }
 
 impl DbUser {
@@ -63,7 +92,6 @@ pub struct Person {
     public_key: PublicKey,
 }
 
-#[async_trait::async_trait]
 impl Object for DbUser {
     type DataType = DatabaseHandle;
     type Kind = Person;

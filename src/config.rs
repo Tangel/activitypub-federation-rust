@@ -21,7 +21,6 @@ use crate::{
     protocol::verification::verify_domains_match,
     traits::{Activity, Actor},
 };
-use async_trait::async_trait;
 use bytes::Bytes;
 use derive_builder::Builder;
 use dyn_clone::{clone_trait_object, DynClone};
@@ -32,8 +31,10 @@ use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use rsa::{pkcs8::DecodePrivateKey, RsaPrivateKey};
 use serde::de::DeserializeOwned;
 use std::{
+    future::Future,
     net::IpAddr,
     ops::Deref,
+    pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -297,7 +298,7 @@ impl<T: Clone> Deref for FederationConfig<T> {
 /// be aborted, return an error. In case of `Ok(())`, processing continues.
 ///
 /// ```
-/// # use async_trait::async_trait;
+/// # use std::{future::Future, pin::Pin};
 /// # use url::Url;
 /// # use activitypub_federation::config::UrlVerifier;
 /// # use activitypub_federation::error::Error;
@@ -311,33 +312,34 @@ impl<T: Clone> Deref for FederationConfig<T> {
 ///     db_connection: DatabaseConnection,
 /// }
 ///
-/// #[async_trait]
 /// impl UrlVerifier for Verifier {
-///     async fn verify(&self, url: &Url) -> Result<(), Error> {
-///         let blocklist = get_blocklist(&self.db_connection).await;
-///         let domain = url.domain().unwrap().to_string();
-///         if blocklist.contains(&domain) {
-///             Err(Error::Other("Domain is blocked".into()))
-///         } else {
-///             Ok(())
-///         }
+///     fn verify(&self, url: &Url) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+///         let url = url.clone();
+///         let db_connection = self.db_connection.clone();
+///         Box::pin(async move {
+///             let blocklist = get_blocklist(&db_connection).await;
+///             let domain = url.domain().unwrap().to_string();
+///             if blocklist.contains(&domain) {
+///                 Err(Error::Other("Domain is blocked".into()))
+///             } else {
+///                 Ok(())
+///             }
+///         })
 ///     }
 /// }
 /// ```
-#[async_trait]
 pub trait UrlVerifier: DynClone + Send {
     /// Should return Ok iff the given url is valid for processing.
-    async fn verify(&self, url: &Url) -> Result<(), Error>;
+    fn verify(&self, url: &Url) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 }
 
 /// Default URL verifier which does nothing.
 #[derive(Clone)]
 struct DefaultUrlVerifier();
 
-#[async_trait]
 impl UrlVerifier for DefaultUrlVerifier {
-    async fn verify(&self, _url: &Url) -> Result<(), Error> {
-        Ok(())
+    fn verify(&self, _url: &Url) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 

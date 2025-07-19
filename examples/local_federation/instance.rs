@@ -4,8 +4,9 @@ use crate::{
 };
 use activitypub_federation::config::{FederationConfig, UrlVerifier};
 use anyhow::anyhow;
-use async_trait::async_trait;
 use std::{
+    future::Future,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -48,16 +49,22 @@ pub struct Database {
 #[derive(Clone)]
 struct MyUrlVerifier();
 
-#[async_trait]
 impl UrlVerifier for MyUrlVerifier {
-    async fn verify(&self, url: &Url) -> Result<(), activitypub_federation::error::Error> {
-        if url.domain() == Some("malicious.com") {
-            Err(activitypub_federation::error::Error::Other(
-                "malicious domain".into(),
-            ))
-        } else {
-            Ok(())
-        }
+    fn verify(
+        &self,
+        url: &Url,
+    ) -> Pin<Box<dyn Future<Output = Result<(), activitypub_federation::error::Error>> + Send + '_>>
+    {
+        let url = url.clone();
+        Box::pin(async move {
+            if url.domain() == Some("malicious.com") {
+                Err(activitypub_federation::error::Error::Other(
+                    "malicious domain".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 

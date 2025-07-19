@@ -1,6 +1,5 @@
 use super::{Actor, Object};
 use crate::{config::Data, error::Error};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,6 @@ pub enum UntaggedEither<L, R> {
     Right(R),
 }
 
-#[async_trait]
 impl<T, R, E, D> Object for Either<T, R>
 where
     T: Object + Object<Error = E, DataType = D> + Send,
@@ -100,7 +98,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T, R, E, D> Actor for Either<T, R>
 where
     T: Actor + Object + Object<Error = E, DataType = D> + Send + 'static,

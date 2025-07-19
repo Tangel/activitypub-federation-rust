@@ -34,7 +34,6 @@ impl Follow {
     }
 }
 
-#[async_trait::async_trait]
 impl Activity for Follow {
     type DataType = DatabaseHandle;
     type Error = crate::error::Error;

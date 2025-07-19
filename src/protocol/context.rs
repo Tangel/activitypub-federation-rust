@@ -54,7 +54,6 @@ impl<T> WithContext<T> {
     }
 }
 
-#[async_trait::async_trait]
 impl<T> Activity for WithContext<T>
 where
     T: Activity + Send + Sync,
