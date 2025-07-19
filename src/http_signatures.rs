@@ -14,16 +14,12 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD as Base64, Engine};
 use bytes::Bytes;
-use http::{uri::PathAndQuery, Uri};
+use http::{header::HeaderName, uri::PathAndQuery, HeaderValue, Method, Uri};
 use http_signature_normalization_reqwest::{
     prelude::{Config, SignExt},
     DefaultSpawner,
 };
-use reqwest::{
-    header::{HeaderName, HeaderValue},
-    Method,
-    Request,
-};
+use reqwest::Request;
 use reqwest_middleware::RequestBuilder;
 use rsa::{
     pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
@@ -57,6 +53,10 @@ impl Keypair {
 }
 
 /// Generate a random asymmetric keypair for ActivityPub HTTP signatures.
+///
+/// Note that this method is very slow in debug mode. To make it faster, follow
+/// instructions in the RSA crate's readme.
+/// <https://github.com/RustCrypto/RSA/blob/master/README.md>
 pub fn generate_actor_keypair() -> Result<Keypair, Error> {
     let mut rng = rand::thread_rng();
     let rsa = RsaPrivateKey::new(&mut rng, 2048)?;
@@ -119,6 +119,7 @@ pub(crate) async fn sign_request(
 ///
 /// Internally, this just converts the headers to a BTreeMap and passes to
 /// `verify_signature_inner` for actual signature verification.
+#[allow(dead_code)]
 pub(crate) fn verify_signature<'a, H>(
     headers: H,
     method: &Method,
@@ -142,6 +143,7 @@ where
 /// from any actor of type A, and returns that actor if a valid signature is found.
 /// This function will return an `Err` variant when no signature is found
 /// or if the signature could not be verified.
+#[allow(dead_code)]
 pub(crate) async fn signing_actor<'a, A, H>(
     headers: H,
     method: &Method,
@@ -227,6 +229,7 @@ fn verify_signature_inner(
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct DigestPart {
     /// We assume that SHA256 is used which is the case with all major fediverse platforms
@@ -261,6 +264,7 @@ impl DigestPart {
 }
 
 /// Verify body of an inbox request against the hash provided in `Digest` header.
+#[allow(dead_code)]
 pub(crate) fn verify_body_hash(
     digest_header: Option<&HeaderValue>,
     body: &[u8],
@@ -280,6 +284,7 @@ pub(crate) fn verify_body_hash(
     Ok(())
 }
 
+/// Internal only
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[allow(missing_docs)]
@@ -302,7 +307,7 @@ pub mod test {
         // use hardcoded date in order to test against hardcoded signature
         headers.insert(
             "date",
-            reqwest::header::HeaderValue::from_str("Tue, 28 Mar 2023 21:03:44 GMT").unwrap(),
+            HeaderValue::from_str("Tue, 28 Mar 2023 21:03:44 GMT").unwrap(),
         );
 
         let request_builder = ClientWithMiddleware::from(Client::new())
@@ -383,6 +388,7 @@ pub mod test {
         assert_eq!(invalid, Err(Error::ActivityBodyDigestInvalid));
     }
 
+    /// Internal only, return hardcoded keypair for testing
     pub fn test_keypair() -> Keypair {
         let rsa = RsaPrivateKey::from_pkcs1_pem(PRIVATE_KEY).unwrap();
         let pkey = RsaPublicKey::from(&rsa);

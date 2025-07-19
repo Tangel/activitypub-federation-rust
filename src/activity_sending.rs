@@ -7,7 +7,7 @@ use crate::{
     error::Error,
     http_signatures::sign_request,
     reqwest_shim::ResponseExt,
-    traits::{ActivityHandler, Actor},
+    traits::{Activity, Actor},
     FEDERATION_CONTENT_TYPE,
 };
 use bytes::Bytes;
@@ -54,14 +54,14 @@ impl SendActivityTask {
     /// - `inboxes`: List of remote actor inboxes that should receive the activity. Ignores local actor
     ///              inboxes. Should be built by calling [crate::traits::Actor::shared_inbox_or_inbox]
     ///              for each target actor.
-    pub async fn prepare<Activity, Datatype, ActorType>(
-        activity: &Activity,
+    pub async fn prepare<A, Datatype, ActorType>(
+        activity: &A,
         actor: &ActorType,
         inboxes: Vec<Url>,
         data: &Data<Datatype>,
     ) -> Result<Vec<SendActivityTask>, Error>
     where
-        Activity: ActivityHandler + Serialize + Debug,
+        A: Activity + Serialize + Debug,
         Datatype: Clone,
         ActorType: Actor,
     {
@@ -136,14 +136,14 @@ impl SendActivityTask {
     }
 }
 
-pub(crate) async fn build_tasks<Activity, Datatype, ActorType>(
-    activity: &Activity,
+pub(crate) async fn build_tasks<A, Datatype, ActorType>(
+    activity: &A,
     actor: &ActorType,
     inboxes: Vec<Url>,
     data: &Data<Datatype>,
 ) -> Result<Vec<SendActivityTask>, Error>
 where
-    Activity: ActivityHandler + Serialize + Debug,
+    A: Activity + Serialize + Debug,
     Datatype: Clone,
     ActorType: Actor,
 {
@@ -190,7 +190,7 @@ where
     // PKey is internally like an Arc<>, so cloning is ok
     data.config
         .actor_pkey_cache
-        .try_get_with_by_ref(&actor_id, async {
+        .try_get_with_by_ref(actor_id, async {
             let private_key_pem = actor.private_key_pem().ok_or_else(|| {
                 Error::Other(format!(
                     "Actor {actor_id} does not contain a private key for signing"
@@ -238,22 +238,14 @@ pub(crate) fn generate_request_headers(inbox_url: &Url) -> HeaderMap {
 mod tests {
     use super::*;
     use crate::{config::FederationConfig, http_signatures::generate_actor_keypair};
-    use axum::extract::State;
-    use bytes::Bytes;
-    use http::StatusCode;
     use std::{
         sync::{atomic::AtomicUsize, Arc},
         time::Instant,
     };
-    use tokio::net::TcpListener;
     use tracing::info;
 
     // This will periodically send back internal errors to test the retry
-    async fn dodgy_handler(
-        State(_state): State<Arc<AtomicUsize>>,
-        headers: http::HeaderMap,
-        body: Bytes,
-    ) -> Result<(), StatusCode> {
+    async fn dodgy_handler(headers: HeaderMap, body: Bytes) -> Result<(), StatusCode> {
         debug!("Headers:{:?}", headers);
         debug!("Body len:{}", body.len());
         Ok(())
@@ -269,12 +261,10 @@ mod tests {
             .route("/", post(dodgy_handler))
             .with_state(state);
 
-        axum::serve(
-            TcpListener::bind("0.0.0.0:8001").await.unwrap(),
-            app.into_make_service(),
-        )
-        .await
-        .unwrap();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8001").await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

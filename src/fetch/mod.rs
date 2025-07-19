@@ -11,7 +11,7 @@ use crate::{
     FEDERATION_CONTENT_TYPE,
 };
 use bytes::Bytes;
-use http::{HeaderValue, StatusCode};
+use http::{header::LOCATION, HeaderValue, StatusCode};
 use serde::de::DeserializeOwned;
 use std::sync::atomic::Ordering;
 use tracing::info;
@@ -59,7 +59,7 @@ pub async fn fetch_object_http<T: Clone, Kind: DeserializeOwned>(
         r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#, // activitypub standard
         r#"application/activity+json; charset=utf-8"#,                             // mastodon
     ];
-    let res = fetch_object_http_with_accept(url, data, &FETCH_CONTENT_TYPE).await?;
+    let res = fetch_object_http_with_accept(url, data, &FETCH_CONTENT_TYPE, false).await?;
 
     // Ensure correct content-type to prevent vulnerabilities, with case insensitive comparison.
     let content_type = res
@@ -74,6 +74,7 @@ pub async fn fetch_object_http<T: Clone, Kind: DeserializeOwned>(
     // Ensure id field matches final url after redirect
     if res.object_id.as_ref() != Some(&res.url) {
         if let Some(res_object_id) = res.object_id {
+            data.config.verify_url_valid(&res_object_id).await?;
             // If id is different but still on the same domain, attempt to request object
             // again from url in id field.
             if res_object_id.domain() == res.url.domain() {
@@ -99,12 +100,13 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
     url: &Url,
     data: &Data<T>,
     content_type: &HeaderValue,
+    recursive: bool,
 ) -> Result<FetchObjectResponse<Kind>, Error> {
     let config = &data.config;
     config.verify_url_valid(url).await?;
     info!("Fetching remote object {}", url.to_string());
 
-    let mut counter = data.request_counter.fetch_add(1, Ordering::SeqCst);
+    let mut counter = data.request_counter.0.fetch_add(1, Ordering::SeqCst);
     // fetch_add returns old value so we need to increment manually here
     counter += 1;
     if counter > config.http_fetch_limit {
@@ -114,7 +116,7 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
     let req = config
         .client
         .get(url.as_str())
-        .header("Accept", content_type.as_bytes())
+        .header("Accept", content_type)
         .timeout(config.request_timeout);
 
     let res = if let Some((actor_id, private_key_pem)) = config.signed_fetch_actor.as_deref() {
@@ -131,16 +133,25 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
         req.send().await?
     };
 
-    if res.status().as_u16() == StatusCode::GONE.as_u16() {
+    // Allow a single redirect using recursion. Further redirects are ignored.
+    let location = res.headers().get(LOCATION).and_then(|l| l.to_str().ok());
+    if let (Some(location), false) = (location, recursive) {
+        let location = location.parse()?;
+        return Box::pin(fetch_object_http_with_accept(
+            &location,
+            data,
+            content_type,
+            true,
+        ))
+        .await;
+    }
+
+    if res.status() == StatusCode::GONE {
         return Err(Error::ObjectDeleted(url.clone()));
     }
 
     let url = res.url().clone();
-    let content_type = res
-        .headers()
-        .get("Content-Type")
-        .cloned()
-        .and_then(|v| HeaderValue::from_maybe_shared(v).ok());
+    let content_type = res.headers().get("Content-Type").cloned();
     let text = res.bytes_limited().await?;
     let object_id = extract_id(&text).ok();
 

@@ -22,23 +22,32 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use std::net::TcpListener;
+use std::net::ToSocketAddrs;
 use tracing::info;
 
 pub fn listen(config: &FederationConfig<DatabaseHandle>) -> Result<(), Error> {
     let hostname = config.domain();
     info!("Listening with axum on {hostname}");
     let config = config.clone();
+
     let app = Router::new()
-        .route("/:user/inbox", post(http_post_user_inbox))
-        .route("/:user", get(http_get_user))
+        .route("/{user}/inbox", post(http_post_user_inbox))
+        .route("/{user}", get(http_get_user))
         .route("/.well-known/webfinger", get(webfinger))
         .layer(FederationMiddleware::new(config));
 
-    let addr = tokio::net::TcpListener::from_std(TcpListener::bind(hostname)?)?;
-    let server = axum::serve(addr, app.into_make_service());
+    let addr = hostname
+        .to_socket_addrs()?
+        .next()
+        .expect("Failed to lookup domain name");
+    let fut = async move {
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    };
 
-    tokio::spawn(async move { server.await.unwrap() });
+    tokio::spawn(fut);
     Ok(())
 }
 
