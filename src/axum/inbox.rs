@@ -7,11 +7,12 @@ use crate::{
     error::Error,
     // http_signatures::verify_signature,
     parse_received_activity,
-    traits::{ActivityHandler, Actor, Object},
+    traits::{Activity, Actor, Object},
 };
 use axum::{
-    extract::{FromRequest, Request},
-    http::StatusCode,
+    body::Body,
+    extract::FromRequest,
+    http::{Request, StatusCode},
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, Method, Uri};
@@ -19,20 +20,20 @@ use serde::de::DeserializeOwned;
 use tracing::debug;
 
 /// Handles incoming activities, verifying HTTP signatures and other checks
-pub async fn receive_activity<Activity, ActorT, Datatype>(
+pub async fn receive_activity<A, ActorT, Datatype>(
     activity_data: ActivityData,
     data: &Data<Datatype>,
-) -> Result<(), <Activity as ActivityHandler>::Error>
+) -> Result<(), <A as Activity>::Error>
 where
-    Activity: ActivityHandler<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
     ActorT: Object<DataType = Datatype> + Actor + Send + 'static,
     for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
-    <Activity as ActivityHandler>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
     <ActorT as Object>::Error: From<Error>,
     Datatype: Clone,
 {
     let (activity, _actor) =
-        parse_received_activity::<Activity, ActorT, _>(&activity_data.body, data).await?;
+        parse_received_activity::<A, ActorT, _>(&activity_data.body, data).await?;
 
     // verify_signature(
     //     &activity_data.headers,
@@ -63,8 +64,22 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let (parts, body) = req.into_parts();
+    async fn from_request(req: Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
+        #[allow(unused_mut)]
+        let (mut parts, body) = req.into_parts();
+
+        // take the full URI to handle nested routers
+        // OriginalUri::from_request_parts has an Infallible error type
+        #[cfg(feature = "axum-original-uri")]
+        let uri = {
+            use axum::extract::{FromRequestParts, OriginalUri};
+            OriginalUri::from_request_parts(&mut parts, _state)
+                .await
+                .expect("infallible")
+                .0
+        };
+        #[cfg(not(feature = "axum-original-uri"))]
+        let uri = parts.uri;
 
         // this wont work if the body is an long running stream
         let bytes = axum::body::to_bytes(body, usize::MAX)
@@ -74,7 +89,7 @@ where
         Ok(Self {
             headers: parts.headers,
             method: parts.method,
-            uri: parts.uri,
+            uri,
             body: bytes.to_vec(),
         })
     }

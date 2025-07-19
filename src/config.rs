@@ -19,7 +19,7 @@ use crate::{
     error::Error,
     http_signatures::sign_request,
     protocol::verification::verify_domains_match,
-    traits::{ActivityHandler, Actor},
+    traits::{Activity, Actor},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -123,12 +123,9 @@ impl<T: Clone> FederationConfig<T> {
         FederationConfigBuilder::default()
     }
 
-    pub(crate) async fn verify_url_and_domain<Activity, Datatype>(
-        &self,
-        activity: &Activity,
-    ) -> Result<(), Error>
+    pub(crate) async fn verify_url_and_domain<A, Datatype>(&self, activity: &A) -> Result<(), Error>
     where
-        Activity: ActivityHandler<DataType = Datatype> + DeserializeOwned + Send + 'static,
+        A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
     {
         verify_domains_match(activity.id(), activity.actor())?;
         self.verify_url_valid(activity.id()).await?;
@@ -256,7 +253,7 @@ impl<T: Clone> FederationConfigBuilder<T> {
 
         let private_key =
             RsaPrivateKey::from_pkcs8_pem(&private_key_pem).expect("Could not decode PEM data");
-        self.signed_fetch_actor = Some(Some(Arc::new((actor.id(), private_key))));
+        self.signed_fetch_actor = Some(Some(Arc::new((actor.id().clone(), private_key))));
         self
     }
 
@@ -354,9 +351,10 @@ clone_trait_object!(UrlVerifier);
 /// prevent denial of service attacks, where an attacker triggers fetching of recursive objects.
 ///
 /// <https://www.w3.org/TR/activitypub/#security-recursive-objects>
+#[derive(Clone)]
 pub struct Data<T: Clone> {
     pub(crate) config: FederationConfig<T>,
-    pub(crate) request_counter: AtomicU32,
+    pub(crate) request_counter: RequestCounter,
 }
 
 impl<T: Clone> Data<T> {
@@ -379,7 +377,7 @@ impl<T: Clone> Data<T> {
     }
     /// Total number of outgoing HTTP requests made with this data.
     pub fn request_count(&self) -> u32 {
-        self.request_counter.load(Ordering::Relaxed)
+        self.request_counter.0.load(Ordering::Relaxed)
     }
 
     /// Add HTTP signature to arbitrary request
@@ -407,6 +405,16 @@ impl<T: Clone> Deref for Data<T> {
 
     fn deref(&self) -> &T {
         &self.config.app_data
+    }
+}
+
+/// Wrapper to implement `Clone`
+#[derive(Default)]
+pub(crate) struct RequestCounter(pub(crate) AtomicU32);
+
+impl Clone for RequestCounter {
+    fn clone(&self) -> Self {
+        RequestCounter(self.0.load(Ordering::Relaxed).into())
     }
 }
 

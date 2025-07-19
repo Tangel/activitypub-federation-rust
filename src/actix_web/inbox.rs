@@ -6,7 +6,7 @@ use crate::{
     error::Error,
     http_signatures::{verify_body_hash, verify_signature},
     parse_received_activity,
-    traits::{ActivityHandler, Actor, Object},
+    traits::{Activity, Actor, Object},
 };
 use actix_web::{web::Bytes, HttpRequest, HttpResponse};
 use serde::de::DeserializeOwned;
@@ -14,17 +14,77 @@ use tracing::debug;
 
 /// Handles incoming activities, verifying HTTP signatures and other checks
 ///
-/// After successful validation, activities are passed to respective [trait@ActivityHandler].
-pub async fn receive_activity<Activity, ActorT, Datatype>(
+/// After successful validation, activities are passed to respective [trait@Activity].
+pub async fn receive_activity<A, ActorT, Datatype>(
     request: HttpRequest,
     body: Bytes,
     data: &Data<Datatype>,
-) -> Result<HttpResponse, <Activity as ActivityHandler>::Error>
+) -> Result<HttpResponse, <A as Activity>::Error>
 where
-    Activity: ActivityHandler<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
     ActorT: Object<DataType = Datatype> + Actor + Send + 'static,
     for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
-    <Activity as ActivityHandler>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <ActorT as Object>::Error: From<Error>,
+    Datatype: Clone,
+{
+    let (activity, _) = do_stuff::<A, ActorT, Datatype>(request, body, data).await?;
+
+    do_more_stuff(activity, data).await
+}
+
+/// Workaround required so we can use references for the hook, instead of cloning data.
+pub trait ReceiveActivityHook<A, ActorT, Datatype>
+where
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + Clone + 'static,
+    ActorT: Object<DataType = Datatype> + Actor + Send + Clone + 'static,
+    for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <ActorT as Object>::Error: From<Error>,
+    Datatype: Clone,
+{
+    /// Called when a new activity is recived
+    fn hook(
+        self,
+        activity: &A,
+        actor: &ActorT,
+        data: &Data<Datatype>,
+    ) -> impl std::future::Future<Output = Result<(), <A as Activity>::Error>>;
+}
+
+/// Same as [receive_activity], only that it calls the provided hook function before
+/// calling activity verify and receive functions.
+pub async fn receive_activity_with_hook<A, ActorT, Datatype>(
+    request: HttpRequest,
+    body: Bytes,
+    hook: impl ReceiveActivityHook<A, ActorT, Datatype>,
+    data: &Data<Datatype>,
+) -> Result<HttpResponse, <A as Activity>::Error>
+where
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + Clone + 'static,
+    ActorT: Object<DataType = Datatype> + Actor + Send + Clone + 'static,
+    for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <ActorT as Object>::Error: From<Error>,
+    Datatype: Clone,
+{
+    let (activity, actor) = do_stuff::<A, ActorT, Datatype>(request, body, data).await?;
+
+    hook.hook(&activity, &actor, data).await?;
+
+    do_more_stuff(activity, data).await
+}
+
+async fn do_stuff<A, ActorT, Datatype>(
+    request: HttpRequest,
+    body: Bytes,
+    data: &Data<Datatype>,
+) -> Result<(A, ActorT), <A as Activity>::Error>
+where
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    ActorT: Object<DataType = Datatype> + Actor + Send + 'static,
+    for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
     <ActorT as Object>::Error: From<Error>,
     Datatype: Clone,
 {
@@ -34,13 +94,24 @@ where
         .map(http_compat::header_value);
     verify_body_hash(digest_header.as_ref(), &body)?;
 
-    let (activity, actor) = parse_received_activity::<Activity, ActorT, _>(&body, data).await?;
+    let (activity, actor) = parse_received_activity::<A, ActorT, _>(&body, data).await?;
 
     let headers = http_compat::header_map(request.headers());
     let method = http_compat::method(request.method());
     let uri = http_compat::uri(request.uri());
     verify_signature(&headers, &method, &uri, actor.public_key_pem())?;
 
+    Ok((activity, actor))
+}
+
+async fn do_more_stuff<A, Datatype>(
+    activity: A,
+    data: &Data<Datatype>,
+) -> Result<HttpResponse, <A as Activity>::Error>
+where
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    Datatype: Clone,
+{
     debug!("Receiving activity {}", activity.id().to_string());
     activity.verify(data).await?;
     activity.receive(data).await?;
@@ -75,15 +146,38 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_receive_activity() {
+    async fn test_receive_activity_hook() {
         let (body, incoming_request, config) = setup_receive_test().await;
-        receive_activity::<Follow, DbUser, DbConnection>(
+        let res = receive_activity_with_hook::<Follow, DbUser, DbConnection>(
             incoming_request.to_http_request(),
             body,
+            Dummy,
             &config.to_request_data(),
         )
-        .await
-        .unwrap();
+        .await;
+        assert_eq!(res.err(), Some(Error::Other("test-error".to_string())));
+    }
+
+    struct Dummy;
+
+    impl<A, ActorT, Datatype> ReceiveActivityHook<A, ActorT, Datatype> for Dummy
+    where
+        A: Activity<DataType = Datatype> + DeserializeOwned + Send + Clone + 'static,
+        ActorT: Object<DataType = Datatype> + Actor + Send + Clone + 'static,
+        for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
+        <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
+        <ActorT as Object>::Error: From<Error>,
+        Datatype: Clone,
+    {
+        async fn hook(
+            self,
+            _activity: &A,
+            _actor: &ActorT,
+            _data: &Data<Datatype>,
+        ) -> Result<(), <A as Activity>::Error> {
+            // ensure that hook gets called by returning this value
+            Err(Error::Other("test-error".to_string()).into())
+        }
     }
 
     #[tokio::test]
@@ -122,14 +216,14 @@ mod test {
         let (_, _, config) = setup_receive_test().await;
 
         let actor = Url::parse("http://ds9.lemmy.ml/u/lemmy_alpha").unwrap();
-        let id = "http://localhost:123/1";
+        let activity_id = "http://localhost:123/1";
         let activity = json!({
           "actor": actor.as_str(),
           "to": ["https://www.w3.org/ns/activitystreams#Public"],
           "object": "http://ds9.lemmy.ml/post/1",
           "cc": ["http://enterprise.lemmy.ml/c/main"],
           "type": "Delete",
-          "id": id
+          "id": activity_id
         }
         );
         let body: Bytes = serde_json::to_vec(&activity).unwrap().into();
@@ -144,8 +238,8 @@ mod test {
         .await;
 
         match res {
-            Err(Error::ParseReceivedActivity(_, url)) => {
-                assert_eq!(id, url.expect("has url").as_str());
+            Err(Error::ParseReceivedActivity { err: _, id }) => {
+                assert_eq!(activity_id, id.expect("has url").as_str());
             }
             _ => unreachable!(),
         }
