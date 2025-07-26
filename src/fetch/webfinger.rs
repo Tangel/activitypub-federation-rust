@@ -10,7 +10,6 @@ use itertools::Itertools;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display, sync::LazyLock};
-use tracing::debug;
 use url::Url;
 
 /// Errors relative to webfinger handling
@@ -62,7 +61,6 @@ where
     let protocol = if data.config.debug { "http" } else { "https" };
     let fetch_url =
         format!("{protocol}://{domain}/.well-known/webfinger?resource=acct:{identifier}");
-    debug!("Fetching webfinger url: {}", &fetch_url);
 
     let res = fetch_object_http_with_accept::<_, Webfinger>(
         &Url::parse(&fetch_url).map_err(Error::UrlParse)?,
@@ -92,9 +90,8 @@ where
 
     for l in links {
         let object = ObjectId::<Kind>::from(l).dereference(data).await;
-        match object {
-            Ok(obj) => return Ok(obj),
-            Err(error) => debug!(%error, "Failed to dereference link"),
+        if let Ok(obj) = object {
+            return Ok(obj);
         }
     }
     Err(WebFingerError::NoValidLink.into_crate_error().into())

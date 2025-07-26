@@ -10,7 +10,6 @@ use crate::{
 };
 use actix_web::{web::Bytes, HttpRequest, HttpResponse};
 use serde::de::DeserializeOwned;
-use tracing::debug;
 
 /// Handles incoming activities, verifying HTTP signatures and other checks
 ///
@@ -112,7 +111,6 @@ where
     A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
     Datatype: Clone,
 {
-    debug!("Receiving activity {}", activity.id().to_string());
     activity.verify(data).await?;
     activity.receive(data).await?;
     Ok(HttpResponse::Ok().finish())

@@ -30,7 +30,6 @@ use rsa::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt::Debug, sync::LazyLock, time::Duration};
-use tracing::debug;
 use url::Url;
 
 /// A private/public key pair used for HTTP signatures
@@ -202,10 +201,6 @@ fn verify_signature_inner(
         .begin_verify(method.as_str(), path_and_query, header_map)
         .map_err(|val| Error::Other(val.to_string()))?
         .verify(|signature, signing_string| -> Result<bool, Error> {
-            debug!(
-                "Verifying with key {}, message {}",
-                &public_key, &signing_string
-            );
             let public_key = RsaPublicKey::from_public_key_pem(public_key)?;
 
             let base64_decoded = Base64
@@ -222,7 +217,6 @@ fn verify_signature_inner(
         })?;
 
     if verified {
-        debug!("verified signature for {}", uri);
         Ok(())
     } else {
         Err(ActivitySignatureInvalid)

@@ -17,7 +17,6 @@ use axum::{
 };
 use http::{HeaderMap, Method, Uri};
 use serde::de::DeserializeOwned;
-use tracing::debug;
 
 /// Handles incoming activities, verifying HTTP signatures and other checks
 pub async fn receive_activity<A, ActorT, Datatype>(
@@ -42,7 +41,6 @@ where
     //     actor.public_key_pem(),
     // )?;
 
-    debug!("Receiving activity {}", activity.id().to_string());
     activity.verify(data).await?;
     activity.receive(data).await?;
     Ok(())
