@@ -35,7 +35,8 @@ unwrap_used = "deny"
 chrono = { version = "0.4.41", features = ["clock"], default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 url = { version = "2.5.4", features = ["serde"] }
-serde_json = { version = "1.0.141", features = ["preserve_order"] }
+# serde_json = { version = "1.0.141", features = ["preserve_order"] }
+sonic-rs = { git = "https://github.com/cloudwego/sonic-rs.git" }
 reqwest = { version = "0.12.22", default-features = false, features = [
   "json",
   "stream",

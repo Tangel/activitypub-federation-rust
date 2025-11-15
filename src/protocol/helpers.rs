@@ -1,6 +1,6 @@
 //! Serde deserialization functions which help to receive differently shaped data
 
-use serde::{Deserialize, Deserializer};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 
 /// Deserialize JSON single value or array into Vec.
 ///
@@ -108,11 +108,11 @@ where
 /// # Ok::<(), anyhow::Error>(())
 pub fn deserialize_skip_error<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
-    T: Deserialize<'de> + Default,
+    T: DeserializeOwned + Default,
     D: Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let inner = T::deserialize(value).unwrap_or_default();
+    let value = sonic_rs::Value::deserialize(deserializer)?;
+    let inner = T::deserialize(&value).unwrap_or_default();
     Ok(inner)
 }
 
@@ -128,7 +128,7 @@ mod tests {
             _to: [Url; 1],
         }
 
-        let note = serde_json::from_str::<Note>(
+        let note = sonic_rs::from_str::<Note>(
             r#"{"_to": ["https://example.com/u/alice", "https://example.com/u/bob"] }"#,
         );
         assert!(note.is_err());

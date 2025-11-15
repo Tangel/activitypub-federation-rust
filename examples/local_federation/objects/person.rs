@@ -149,7 +149,7 @@ impl DbUser {
     ) -> Result<(), Error>
     where
         A: Activity + Serialize + Debug + Send + Sync,
-        <A as Activity>::Error: From<anyhow::Error> + From<serde_json::Error>,
+        <A as Activity>::Error: From<anyhow::Error> + From<sonic_rs::Error>,
     {
         let activity = WithContext::new_default(activity);
         // Send through queue in some cases and bypass it in others to test both code paths

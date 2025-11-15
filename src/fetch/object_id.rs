@@ -283,10 +283,10 @@ pub mod tests {
     fn test_deserialize() {
         let id = ObjectId::<DbUser>::parse("http://test.com/").unwrap();
 
-        let string = serde_json::to_string(&id).unwrap();
+        let string = sonic_rs::to_string(&id).unwrap();
         assert_eq!("\"http://test.com/\"", string);
 
-        let parsed: ObjectId<DbUser> = serde_json::from_str(&string).unwrap();
+        let parsed: ObjectId<DbUser> = sonic_rs::from_str(&string).unwrap();
         assert_eq!(parsed, id);
     }
 

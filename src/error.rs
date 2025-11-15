@@ -39,10 +39,10 @@ pub enum Error {
     WebfingerResolveFailed(#[from] WebFingerError),
     /// Failed to serialize outgoing activity
     #[error("Failed to serialize outgoing activity {1}: {0}")]
-    SerializeOutgoingActivity(serde_json::Error, String),
+    SerializeOutgoingActivity(sonic_rs::Error, String),
     /// Failed to parse an object fetched from url
     #[error("Failed to parse object {1} with content {2}: {0}")]
-    ParseFetchedObject(serde_json::Error, Url, String),
+    ParseFetchedObject(sonic_rs::Error, Url, String),
     /// Failed to parse an activity received from another instance
     #[error("Failed to parse incoming activity {}: {0}", match .id {
         Some(t) => format!("with id {t}"),
@@ -50,7 +50,7 @@ pub enum Error {
     })]
     ParseReceivedActivity {
         /// The parse error
-        err: serde_json::Error,
+        err: sonic_rs::Error,
         /// ID of the Activitypub object which caused this error
         id: Option<Url>,
     },

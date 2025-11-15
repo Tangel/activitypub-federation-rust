@@ -130,7 +130,7 @@ mod test {
     use actix_web::test::TestRequest;
     use reqwest::Client;
     use reqwest_middleware::ClientWithMiddleware;
-    use serde_json::json;
+    use sonic_rs::json;
     use url::Url;
 
     /// Remove this conversion helper after actix-web upgrades to http 1.0
@@ -224,7 +224,7 @@ mod test {
           "id": activity_id
         }
         );
-        let body: Bytes = serde_json::to_vec(&activity).unwrap().into();
+        let body: Bytes = sonic_rs::to_vec(&activity).unwrap().into();
         let incoming_request = construct_request(&body, &actor).await;
 
         // intentionally cause a parse error by using wrong type for deser
@@ -272,7 +272,7 @@ mod test {
             kind: Default::default(),
             id: "http://localhost:123/1".try_into().unwrap(),
         };
-        let body: Bytes = serde_json::to_vec(&activity).unwrap().into();
+        let body: Bytes = sonic_rs::to_vec(&activity).unwrap().into();
         let incoming_request = construct_request(&body, activity.actor.inner()).await;
 
         let config = FederationConfig::builder()

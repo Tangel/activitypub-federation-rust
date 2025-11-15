@@ -21,7 +21,8 @@
 
 use crate::{config::Data, traits::Activity};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sonic_rs::Value;
+use std::str::FromStr;
 use url::Url;
 
 /// Default context used in Activitypub
@@ -39,7 +40,7 @@ pub struct WithContext<T> {
 impl<T> WithContext<T> {
     /// Create a new wrapper with the default Activitypub context.
     pub fn new_default(inner: T) -> WithContext<T> {
-        let context = Value::String(DEFAULT_CONTEXT.to_string());
+        let context = Value::from_str(DEFAULT_CONTEXT).unwrap();
         WithContext::new(inner, context)
     }
 

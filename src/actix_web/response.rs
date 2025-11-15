@@ -7,7 +7,7 @@ use crate::{
 use actix_web::HttpResponse;
 use http02::header::VARY;
 use serde::Serialize;
-use serde_json::Value;
+use sonic_rs::Value;
 use url::Url;
 
 /// Generates HTTP response to serve the object for fetching from other instances.
@@ -19,8 +19,8 @@ use url::Url;
 pub fn create_http_response<T: Serialize>(
     data: T,
     federation_context: &Value,
-) -> Result<HttpResponse, serde_json::Error> {
-    let json = serde_json::to_string_pretty(&WithContext::new(data, federation_context.clone()))?;
+) -> Result<HttpResponse, sonic_rs::Error> {
+    let json = sonic_rs::to_string_pretty(&WithContext::new(data, federation_context.clone()))?;
 
     Ok(HttpResponse::Ok()
         .content_type(FEDERATION_CONTENT_TYPE)
@@ -31,10 +31,10 @@ pub fn create_http_response<T: Serialize>(
 pub(crate) fn create_tombstone_response(
     id: Url,
     federation_context: &Value,
-) -> Result<HttpResponse, serde_json::Error> {
+) -> Result<HttpResponse, sonic_rs::Error> {
     let tombstone = Tombstone::new(id);
     let json =
-        serde_json::to_string_pretty(&WithContext::new(tombstone, federation_context.clone()))?;
+        sonic_rs::to_string_pretty(&WithContext::new(tombstone, federation_context.clone()))?;
 
     Ok(HttpResponse::Gone()
         .content_type(FEDERATION_CONTENT_TYPE)

@@ -155,7 +155,7 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
     let text = res.bytes_limited().await?;
     let object_id = extract_id(&text).ok();
 
-    match serde_json::from_slice(&text) {
+    match sonic_rs::from_slice(&text) {
         Ok(object) => Ok(FetchObjectResponse {
             object,
             url,

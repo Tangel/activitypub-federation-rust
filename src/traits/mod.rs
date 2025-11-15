@@ -181,11 +181,11 @@ pub trait Object: Sized + Debug {
     #[cfg(feature = "actix-web")]
     async fn http_response(
         self,
-        federation_context: &serde_json::Value,
+        federation_context: &sonic_rs::Value,
         data: &Data<Self::DataType>,
     ) -> Result<actix_web::HttpResponse, Self::Error>
     where
-        Self::Error: From<serde_json::Error>,
+        Self::Error: From<sonic_rs::Error>,
         Self::Kind: serde::Serialize + Send,
     {
         use crate::actix_web::response::{

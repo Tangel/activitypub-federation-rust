@@ -31,7 +31,6 @@ use crate::{
     traits::{Activity, Actor, Object},
 };
 pub use activitystreams_kinds as kinds;
-pub use serde_json;
 
 use serde::{de::DeserializeOwned, Deserialize};
 use url::Url;
@@ -53,7 +52,7 @@ where
     <ActorT as Object>::Error: From<Error>,
     Datatype: Clone,
 {
-    let activity: A = serde_json::from_slice(body).map_err(|err| {
+    let activity: A = sonic_rs::from_slice(body).map_err(|err| {
         // Attempt to include activity id in error message
         let id = extract_id(body).ok();
         Error::ParseReceivedActivity { err, id }
@@ -66,10 +65,10 @@ where
 }
 
 /// Attempt to parse id field from serialized json
-fn extract_id(data: &[u8]) -> serde_json::Result<Url> {
+fn extract_id(data: &[u8]) -> sonic_rs::Result<Url> {
     #[derive(Deserialize)]
     struct Id {
         id: Url,
     }
-    Ok(serde_json::from_slice::<Id>(data)?.id)
+    Ok(sonic_rs::from_slice::<Id>(data)?.id)
 }

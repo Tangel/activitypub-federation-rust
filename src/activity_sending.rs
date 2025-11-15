@@ -150,7 +150,7 @@ where
     let config = &data.config;
     let actor_id = activity.actor();
     let activity_id = activity.id();
-    let activity_serialized: Bytes = serde_json::to_vec(activity)
+    let activity_serialized: Bytes = sonic_rs::to_vec(activity)
         .map_err(|e| Error::SerializeOutgoingActivity(e, format!("{:?}", activity)))?
         .into();
     let private_key = get_pkey_cached(data, actor).await?;
