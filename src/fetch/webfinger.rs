@@ -45,7 +45,7 @@ pub async fn webfinger_resolve_actor<T: Clone, Kind>(
     data: &Data<T>,
 ) -> Result<Kind, <Kind as Object>::Error>
 where
-    Kind: Object + Actor + Send + 'static + Object<DataType = T>,
+    Kind: Object + Actor + Send + Sync + 'static + Object<DataType = T>,
     for<'de2> <Kind as Object>::Kind: serde::Deserialize<'de2>,
     <Kind as Object>::Error: From<crate::error::Error> + Send + Sync + Display,
 {
@@ -88,6 +88,7 @@ where
             }
         })
         .filter_map(|l| l.href.clone())
+        .rev()
         .collect();
 
     for l in links {
@@ -222,7 +223,7 @@ pub fn build_webfinger_response_with_type(
 }
 
 /// A webfinger response with information about a `Person` or other type of actor.
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
 pub struct Webfinger {
     /// The actor which is described here, for example `acct:LemmyDev@mastodon.social`
     pub subject: String,
@@ -237,7 +238,7 @@ pub struct Webfinger {
 }
 
 /// A single link included as part of a [Webfinger] response.
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
 pub struct WebfingerLink {
     /// Relationship of the link, such as `self` or `http://webfinger.net/rel/profile-page`
     pub rel: Option<String>,
