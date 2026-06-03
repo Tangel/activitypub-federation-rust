@@ -65,7 +65,7 @@ async fn main() -> Result<(), Error> {
         .next()
         .expect("Failed to lookup domain name");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service()).await;
 
     Ok(())
 }

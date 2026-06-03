@@ -48,7 +48,6 @@ pub mod tests;
 ///     content: String,
 /// }
 ///
-/// #[async_trait::async_trait]
 /// impl Object for DbPost {
 ///     type DataType = DbConnection;
 ///     type Kind = Note;
@@ -170,40 +169,6 @@ pub trait Object: Sized + Debug {
     /// should write the received object to database. Note that there is no distinction between
     /// create and update, so an `upsert` operation should be used.
     async fn from_json(json: Self::Kind, data: &Data<Self::DataType>) -> Result<Self, Self::Error>;
-
-    /// Generates HTTP response to serve the object for fetching from other instances.
-    ///
-    /// - If the object has a remote domain, sends a redirect to the original instance.
-    /// - If [Object.is_deleted] returns true, returns a [crate::protocol::tombstone::Tombstone] instead.
-    /// - Otherwise serves the object JSON using [Object.into_json] and pretty-print
-    ///
-    /// `federation_context` is the value of `@context`.
-    #[cfg(feature = "actix-web")]
-    async fn http_response(
-        self,
-        federation_context: &sonic_rs::Value,
-        data: &Data<Self::DataType>,
-    ) -> Result<actix_web::HttpResponse, Self::Error>
-    where
-        Self::Error: From<sonic_rs::Error>,
-        Self::Kind: serde::Serialize + Send,
-    {
-        use crate::actix_web::response::{
-            create_http_response,
-            create_tombstone_response,
-            redirect_remote_object,
-        };
-        let id = self.id();
-        let res = if !data.config.is_local_url(id) {
-            redirect_remote_object(id)
-        } else if !self.is_deleted() {
-            let json = self.into_json(data).await?;
-            create_http_response(json, federation_context)?
-        } else {
-            create_tombstone_response(id.clone(), federation_context)?
-        };
-        Ok(res)
-    }
 }
 
 /// Handler for receiving incoming activities.
@@ -224,7 +189,6 @@ pub trait Object: Sized + Debug {
 ///     id: Url,
 /// }
 ///
-/// #[async_trait::async_trait]
 /// impl Activity for Follow {
 ///     type DataType = DbConnection;
 ///     type Error = anyhow::Error;

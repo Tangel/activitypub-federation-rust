@@ -452,9 +452,7 @@ mod tests {
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:8002").await.unwrap();
-        axum::serve(listener, app.into_make_service())
-            .await
-            .unwrap();
+        axum::serve(listener, app.into_make_service()).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

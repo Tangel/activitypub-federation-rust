@@ -1,19 +1,15 @@
 #![allow(clippy::unwrap_used)]
 
 use crate::{
-    instance::{listen, new_instance, Webserver},
+    instance::{listen, new_instance},
     objects::post::DbPost,
     utils::generate_object_id,
 };
 use error::Error;
-use std::{env::args, str::FromStr};
 use tokio::try_join;
 use tracing::log::{info, LevelFilter};
 
 mod activities;
-#[cfg(feature = "actix-web")]
-mod actix_web;
-#[cfg(feature = "axum")]
 mod axum;
 mod error;
 mod instance;
@@ -29,18 +25,14 @@ async fn main() -> Result<(), Error> {
         .format_timestamp(None)
         .init();
 
-    info!("Start with parameter `axum` or `actix-web` to select the webserver");
-    let webserver = args()
-        .nth(1)
-        .map(|arg| Webserver::from_str(&arg).unwrap())
-        .unwrap_or(Webserver::Axum);
+    info!("Start local federation example with axum");
 
     let (alpha, beta) = try_join!(
         new_instance("localhost:8001", "alpha".to_string()),
         new_instance("localhost:8002", "beta".to_string())
     )?;
-    listen(&alpha, &webserver)?;
-    listen(&beta, &webserver)?;
+    listen(&alpha)?;
+    listen(&beta)?;
     info!("Local instances started");
 
     info!("Alpha user follows beta user via webfinger");

@@ -37,20 +37,11 @@ steps:
     when:
       - event: pull_request
 
-  cargo_run_actix_example:
-    image: *rust_image
-    environment:
-      CARGO_HOME: .cargo
-    commands:
-      - cargo run --example local_federation actix-web
-    when:
-      - event: pull_request
-
   cargo_run_axum_example:
     image: *rust_image
     environment:
       CARGO_HOME: .cargo
     commands:
-      - cargo run --example local_federation axum
+      - cargo run --example local_federation
     when:
       - event: pull_request

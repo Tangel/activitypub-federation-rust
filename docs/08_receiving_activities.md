@@ -6,7 +6,6 @@ Activitypub propagates actions across servers using `Activities`. For this each 
 # use serde::{Deserialize, Serialize};
 # use url::Url;
 # use anyhow::Error;
-# use async_trait::async_trait;
 # use activitypub_federation::fetch::object_id::ObjectId;
 # use activitypub_federation::traits::tests::{DbConnection, DbUser};
 # use activitystreams_kinds::activity::FollowType;
@@ -24,7 +23,6 @@ pub struct Follow {
     pub id: Url,
 }
 
-#[async_trait]
 impl Activity for Follow {
     type DataType = DbConnection;
     type Error = Error;
@@ -58,6 +56,7 @@ Next its time to setup the actual HTTP handler for the inbox. For this we first 
 # use axum::response::IntoResponse;
 # use activitypub_federation::axum::inbox::{ActivityData, receive_activity};
 # use activitypub_federation::config::Data;
+# use activitypub_federation::error::Error;
 # use activitypub_federation::protocol::context::WithContext;
 # use activitypub_federation::traits::Activity;
 # use activitypub_federation::traits::tests::{DbConnection, DbUser, Follow};
@@ -66,9 +65,37 @@ Next its time to setup the actual HTTP handler for the inbox. For this we first 
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(untagged)]
-#[enum_delegate::implement(Activity)]
 pub enum PersonAcceptedActivities {
     Follow(Follow),
+}
+
+impl Activity for PersonAcceptedActivities {
+    type DataType = DbConnection;
+    type Error = Error;
+
+    fn id(&self) -> &Url {
+        match self {
+            PersonAcceptedActivities::Follow(activity) => activity.id(),
+        }
+    }
+
+    fn actor(&self) -> &Url {
+        match self {
+            PersonAcceptedActivities::Follow(activity) => activity.actor(),
+        }
+    }
+
+    async fn verify(&self, data: &Data<Self::DataType>) -> Result<(), Self::Error> {
+        match self {
+            PersonAcceptedActivities::Follow(activity) => activity.verify(data).await,
+        }
+    }
+
+    async fn receive(self, data: &Data<Self::DataType>) -> Result<(), Self::Error> {
+        match self {
+            PersonAcceptedActivities::Follow(activity) => activity.receive(data).await,
+        }
+    }
 }
 
 async fn http_post_user_inbox(

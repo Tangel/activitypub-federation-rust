@@ -8,7 +8,7 @@
 //! deserialized if `media_type` is `text/markdown`, but not if it is `text/html`.
 //!
 //! ```
-//! use serde_json::from_str;
+//! use sonic_rs::from_str;
 //! use serde::{Deserialize, Serialize};
 //! use activitypub_federation::protocol::values::MediaTypeMarkdown;
 //!

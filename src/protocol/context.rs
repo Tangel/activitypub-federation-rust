@@ -14,9 +14,9 @@
 //!     content: "Hello world".to_string()
 //! };
 //! let note_with_context = WithContext::new_default(note);
-//! let serialized = serde_json::to_string(&note_with_context)?;
+//! let serialized = sonic_rs::to_string(&note_with_context)?;
 //! assert_eq!(serialized, r#"{"@context":"https://www.w3.org/ns/activitystreams","content":"Hello world"}"#);
-//! Ok::<(), serde_json::error::Error>(())
+//! Ok::<(), sonic_rs::Error>(())
 //! ```
 
 use crate::{config::Data, traits::Activity};

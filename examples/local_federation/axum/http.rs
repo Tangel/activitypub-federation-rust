@@ -42,9 +42,7 @@ pub fn listen(config: &FederationConfig<DatabaseHandle>) -> Result<(), Error> {
         .expect("Failed to lookup domain name");
     let fut = async move {
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app.into_make_service())
-            .await
-            .unwrap();
+        axum::serve(listener, app.into_make_service()).await;
     };
 
     tokio::spawn(fut);

@@ -7,7 +7,6 @@ use anyhow::anyhow;
 use std::{
     future::Future,
     pin::Pin,
-    str::FromStr,
     sync::{Arc, Mutex},
 };
 use url::Url;
@@ -21,7 +20,6 @@ pub async fn new_instance(
 
     let local_user = DbUser::new(hostname, name)?;
     let database = Arc::new(Database {
-        system_user: system_user.clone(),
         users: Mutex::new(vec![local_user]),
         posts: Mutex::new(vec![]),
     });
@@ -40,7 +38,6 @@ pub type DatabaseHandle = Arc<Database>;
 
 /// Our "database" which contains all known posts and users (local and federated)
 pub struct Database {
-    pub system_user: DbUser,
     pub users: Mutex<Vec<DbUser>>,
     pub posts: Mutex<Vec<DbPost>>,
 }
@@ -68,31 +65,8 @@ impl UrlVerifier for MyUrlVerifier {
     }
 }
 
-pub enum Webserver {
-    Axum,
-    ActixWeb,
-}
-
-impl FromStr for Webserver {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "axum" => Webserver::Axum,
-            "actix-web" => Webserver::ActixWeb,
-            _ => panic!("Invalid webserver parameter, must be either `axum` or `actix-web`"),
-        })
-    }
-}
-
-pub fn listen(
-    config: &FederationConfig<DatabaseHandle>,
-    webserver: &Webserver,
-) -> Result<(), Error> {
-    match webserver {
-        Webserver::Axum => crate::axum::http::listen(config)?,
-        Webserver::ActixWeb => crate::actix_web::http::listen(config)?,
-    }
+pub fn listen(config: &FederationConfig<DatabaseHandle>) -> Result<(), Error> {
+    crate::axum::http::listen(config)?;
     Ok(())
 }
 

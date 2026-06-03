@@ -16,10 +16,10 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 ///     to: Vec<Url>
 /// }
 ///
-/// let single: Note = serde_json::from_str(r#"{"to": "https://example.com/u/alice" }"#)?;
+/// let single: Note = sonic_rs::from_str(r#"{"to": "https://example.com/u/alice" }"#)?;
 /// assert_eq!(single.to.len(), 1);
 ///
-/// let multiple: Note = serde_json::from_str(
+/// let multiple: Note = sonic_rs::from_str(
 /// r#"{"to": [
 ///      "https://example.com/u/alice",
 ///      "https://lemmy.ml/u/bob"
@@ -59,7 +59,7 @@ where
 ///     to: [Url; 1]
 /// }
 ///
-/// let note = serde_json::from_str::<Note>(r#"{"to": ["https://example.com/u/alice"] }"#);
+/// let note = sonic_rs::from_str::<Note>(r#"{"to": ["https://example.com/u/alice"] }"#);
 /// assert!(note.is_ok());
 pub fn deserialize_one<'de, T, D>(deserializer: D) -> Result<[T; 1], D::Error>
 where
@@ -96,7 +96,7 @@ where
 ///     source: Option<String>
 /// }
 ///
-/// let note = serde_json::from_str::<Note>(
+/// let note = sonic_rs::from_str::<Note>(
 /// r#"{
 ///     "content": "How are you?",
 ///     "source": {
