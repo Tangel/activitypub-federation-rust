@@ -1,13 +1,25 @@
 //! Serde deserialization functions which help to receive differently shaped data
 
-use serde::{de::DeserializeOwned, Deserialize, Deserializer};
+use activitystreams_kinds::public;
+use itertools::Itertools;
+use serde::{
+    de::{DeserializeOwned, Error},
+    Deserialize,
+    Deserializer,
+};
+use url::Url;
 
-/// Deserialize JSON single value or array into Vec.
+/// Deserialize JSON single value or array into `Vec<Url>`.
 ///
 /// Useful if your application can handle multiple values for a field, but another federated
 /// platform only sends a single one.
 ///
+/// Also accepts common `Public` aliases for recipient fields. Some implementations send `Public`
+/// or `as:Public` instead of the canonical `https://www.w3.org/ns/activitystreams#Public` URL
+/// in fields such as `to` and `cc`.
+///
 /// ```
+/// # use activitypub_federation::kinds::public;
 /// # use activitypub_federation::protocol::helpers::deserialize_one_or_many;
 /// # use url::Url;
 /// #[derive(serde::Deserialize)]
@@ -25,24 +37,45 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 ///      "https://lemmy.ml/u/bob"
 /// ]}"#)?;
 /// assert_eq!(multiple.to.len(), 2);
-/// Ok::<(), anyhow::Error>(())
-pub fn deserialize_one_or_many<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
+///
+/// let note: Note = sonic_rs::from_str(r#"{"to": ["Public", "as:Public"]}"#)?;
+/// assert_eq!(note.to, vec![public()]);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn deserialize_one_or_many<'de, D>(deserializer: D) -> Result<Vec<Url>, D::Error>
 where
-    T: Deserialize<'de>,
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany<T> {
-        One(T),
-        Many(Vec<T>),
+    struct PublicAwareUrl(Url);
+
+    impl<'de> Deserialize<'de> for PublicAwareUrl {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer)?;
+            let url = match value.as_str() {
+                "Public" | "as:Public" => public(),
+                _ => Url::parse(&value).map_err(D::Error::custom)?,
+            };
+            Ok(PublicAwareUrl(url))
+        }
     }
 
-    let result: OneOrMany<T> = Deserialize::deserialize(deserializer)?;
-    Ok(match result {
-        OneOrMany::Many(list) => list,
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<PublicAwareUrl>),
+        One(PublicAwareUrl),
+    }
+
+    let result: OneOrMany = Deserialize::deserialize(deserializer)?;
+    let values = match result {
         OneOrMany::One(value) => vec![value],
-    })
+        OneOrMany::Many(values) => values,
+    };
+
+    Ok(values.into_iter().map(|value| value.0).unique().collect())
 }
 
 /// Deserialize JSON single value or single element array into single value.
@@ -140,6 +173,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::deserialize_one_or_many;
+    use activitystreams_kinds::public;
+    use anyhow::Result;
+    use serde::Deserialize;
+
     #[test]
     fn deserialize_one_multiple_values() {
         use crate::protocol::helpers::deserialize_one;
@@ -154,5 +192,71 @@ mod tests {
             r#"{"_to": ["https://example.com/u/alice", "https://example.com/u/bob"] }"#,
         );
         assert!(note.is_err());
+    }
+
+    #[test]
+    fn deserialize_one_or_many_single_public_aliases() -> Result<()> {
+        use url::Url;
+
+        #[derive(Deserialize)]
+        struct Note {
+            #[serde(deserialize_with = "deserialize_one_or_many")]
+            to: Vec<Url>,
+        }
+
+        for alias in ["Public", "as:Public"] {
+            let note = sonic_rs::from_str::<Note>(&format!(r#"{{"to": "{alias}"}}"#))?;
+            assert_eq!(note.to, vec![public()]);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_one_or_many_array() -> Result<()> {
+        use url::Url;
+
+        #[derive(Deserialize)]
+        struct Note {
+            #[serde(deserialize_with = "deserialize_one_or_many")]
+            to: Vec<Url>,
+        }
+
+        let note = sonic_rs::from_str::<Note>(
+            r#"{
+                "to": [
+                    "https://example.com/c/main",
+                    "Public",
+                    "as:Public",
+                    "https://www.w3.org/ns/activitystreams#Public"
+                ]
+            }"#,
+        )?;
+
+        assert_eq!(
+            note.to,
+            vec![Url::parse("https://example.com/c/main")?, public(),]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_one_or_many_leaves_other_strings_unchanged() -> Result<()> {
+        use url::Url;
+
+        #[derive(Deserialize)]
+        struct Note {
+            #[serde(deserialize_with = "deserialize_one_or_many")]
+            to: Vec<Url>,
+            content: String,
+        }
+
+        let note = sonic_rs::from_str::<Note>(r#"{"to": "Public", "content": "Public"}"#)?;
+
+        assert_eq!(note.to, vec![public()]);
+        assert_eq!(note.content, "Public");
+
+        Ok(())
     }
 }
