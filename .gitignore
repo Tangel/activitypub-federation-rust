@@ -12,3 +12,9 @@ flamegraph.svg
 /flake.lock
 
 .vscode
+
+.agents
+.claude
+.codex
+AGENTS.md
+.mcp.json
