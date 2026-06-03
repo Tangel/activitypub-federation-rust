@@ -3,7 +3,7 @@
 use activitystreams_kinds::public;
 use itertools::Itertools;
 use serde::{
-    de::{DeserializeOwned, Error},
+    de::{Error, IgnoredAny},
     Deserialize,
     Deserializer,
 };
@@ -141,12 +141,20 @@ where
 /// # Ok::<(), anyhow::Error>(())
 pub fn deserialize_skip_error<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
-    T: DeserializeOwned + Default,
+    T: Deserialize<'de> + Default,
     D: Deserializer<'de>,
 {
-    let value = sonic_rs::Value::deserialize(deserializer)?;
-    let inner = T::deserialize(&value).unwrap_or_default();
-    Ok(inner)
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ValueOrIgnored<T> {
+        Value(T),
+        Ignored(IgnoredAny),
+    }
+
+    match ValueOrIgnored::<T>::deserialize(deserializer) {
+        Ok(ValueOrIgnored::Value(value)) => Ok(value),
+        Ok(ValueOrIgnored::Ignored(_)) | Err(_) => Ok(T::default()),
+    }
 }
 
 /// Deserialize either single value or last item from an array into an optional field.
