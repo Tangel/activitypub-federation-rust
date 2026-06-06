@@ -34,6 +34,7 @@ sonic-rs = { git = "https://github.com/cloudwego/sonic-rs.git" }
 reqwest = { version = "0.13.4", default-features = false, features = [
   "json",
   "stream",
+  "rustls",
 ] }
 reqwest-middleware = "0.5.2"
 tracing = { version = "0.1.44", features = ["log"] }
