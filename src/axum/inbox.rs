@@ -18,6 +18,9 @@ use axum::{
 use http::{HeaderMap, Method, Uri};
 use serde::de::DeserializeOwned;
 
+const INBOX_BODY_LIMIT: usize = 1024 * 1024;
+const BODY_LENGTH_LIMIT_ERROR: &str = "length limit exceeded";
+
 /// Handles incoming activities, verifying HTTP signatures and other checks
 pub async fn receive_activity<A, ActorT, Datatype>(
     activity_data: ActivityData,
@@ -80,9 +83,16 @@ where
         let uri = parts.uri;
 
         // this wont work if the body is an long running stream
-        let bytes = axum::body::to_bytes(body, usize::MAX)
+        let bytes = axum::body::to_bytes(body, INBOX_BODY_LIMIT)
             .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())?;
+            .map_err(|err| {
+                let status = if is_body_length_limit_error(&err) {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (status, err.to_string()).into_response()
+            })?;
 
         Ok(Self {
             headers: parts.headers,
@@ -93,4 +103,54 @@ where
     }
 }
 
-// TODO: add more inbox tests for axum.
+fn is_body_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.to_string() == BODY_LENGTH_LIMIT_ERROR {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActivityData, INBOX_BODY_LIMIT};
+    use axum::{
+        body::Body,
+        extract::FromRequest,
+        http::{Request, StatusCode},
+    };
+
+    fn request_with_body_size(size: usize) -> Request<Body> {
+        Request::new(Body::from(vec![0; size]))
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_is_accepted() {
+        let activity_data =
+            match ActivityData::from_request(request_with_body_size(INBOX_BODY_LIMIT), &()).await {
+                Ok(activity_data) => activity_data,
+                Err(response) => panic!(
+                    "expected body at limit to be accepted, got {}",
+                    response.status()
+                ),
+            };
+
+        assert_eq!(activity_data.body.len(), INBOX_BODY_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn body_over_limit_is_rejected_with_payload_too_large() {
+        let response =
+            match ActivityData::from_request(request_with_body_size(INBOX_BODY_LIMIT + 1), &())
+                .await
+            {
+                Ok(_) => panic!("expected body over limit to be rejected"),
+                Err(response) => response,
+            };
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
