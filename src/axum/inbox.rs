@@ -5,7 +5,7 @@
 use crate::{
     config::Data,
     error::Error,
-    // http_signatures::verify_signature,
+    http_signatures::{verify_actor_key_id, verify_body_hash, verify_signature},
     parse_received_activity,
     traits::{Activity, Actor, Object},
 };
@@ -34,15 +34,17 @@ where
     <ActorT as Object>::Error: From<Error>,
     Datatype: Clone,
 {
-    let (activity, _actor) =
+    let (activity, actor) =
         parse_received_activity::<A, ActorT, _>(&activity_data.body, data).await?;
 
-    // verify_signature(
-    //     &activity_data.headers,
-    //     &activity_data.method,
-    //     &activity_data.uri,
-    //     actor.public_key_pem(),
-    // )?;
+    verify_body_hash(activity_data.headers.get("digest"), &activity_data.body)?;
+    let verified_signature = verify_signature(
+        &activity_data.headers,
+        &activity_data.method,
+        &activity_data.uri,
+        actor.public_key_pem(),
+    )?;
+    verify_actor_key_id(&actor, &verified_signature.key_id)?;
 
     activity.verify(data).await?;
     activity.receive(data).await?;
@@ -127,6 +129,27 @@ mod tests {
         Request::new(Body::from(vec![0; size]))
     }
 
+    #[test]
+    fn receive_activity_runs_protocol_checks_before_business_verify() {
+        let source = include_str!("inbox.rs");
+        let digest_index = source
+            .find("verify_body_hash(")
+            .expect("receive_activity should verify Digest body hash");
+        let signature_index = source
+            .find("verify_signature(")
+            .expect("receive_activity should verify HTTP Signature");
+        let binding_index = source
+            .find("verify_actor_key_id(")
+            .expect("receive_activity should bind key id to actor");
+        let business_index = source
+            .find("activity.verify(data).await?")
+            .expect("receive_activity should still call business verify");
+
+        assert!(digest_index < business_index);
+        assert!(signature_index < business_index);
+        assert!(binding_index < business_index);
+    }
+
     #[tokio::test]
     async fn body_at_limit_is_accepted() {
         let activity_data =
@@ -152,5 +175,22 @@ mod tests {
             };
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[cfg(feature = "axum-original-uri")]
+    #[tokio::test]
+    async fn activity_data_uses_original_uri_under_nested_router() {
+        use axum::{extract::OriginalUri, http::Uri};
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/activitypub/inbox")
+            .extension(OriginalUri(Uri::from_static("/api/activitypub/inbox")))
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let activity_data = ActivityData::from_request(request, &()).await.unwrap();
+
+        assert_eq!(activity_data.uri.path(), "/api/activitypub/inbox");
     }
 }

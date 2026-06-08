@@ -74,6 +74,11 @@ pub fn generate_actor_keypair() -> Result<Keypair, Error> {
 /// to avoid any potential problems due to wrong clocks, overloaded servers or delayed delivery.
 pub(crate) const EXPIRES_AFTER: Duration = Duration::from_secs(60 * 60);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedSignature {
+    pub key_id: String,
+}
+
 /// Creates an HTTP post request to `inbox_url`, with the given `client` and `headers`, and
 /// `activity` as request body. The request is signed with `private_key` and then sent.
 pub(crate) async fn sign_request(
@@ -123,7 +128,7 @@ pub(crate) fn verify_signature<'a, H>(
     method: &Method,
     uri: &Uri,
     public_key: &str,
-) -> Result<(), Error>
+) -> Result<VerifiedSignature, Error>
 where
     H: IntoIterator<Item = (&'a HeaderName, &'a HeaderValue)>,
 {
@@ -187,7 +192,7 @@ fn verify_signature_inner(
     method: &Method,
     uri: &Uri,
     public_key: &str,
-) -> Result<(), Error> {
+) -> Result<VerifiedSignature, Error> {
     static CONFIG: LazyLock<http_signature_normalization::Config> = LazyLock::new(|| {
         http_signature_normalization::Config::new()
             .set_expiration(EXPIRES_AFTER)
@@ -196,30 +201,40 @@ fn verify_signature_inner(
 
     let path_and_query = uri.path_and_query().map(PathAndQuery::as_str).unwrap_or("");
 
-    let verified = CONFIG
+    let unverified = CONFIG
         .begin_verify(method.as_str(), path_and_query, header_map)
-        .map_err(|val| Error::Other(val.to_string()))?
-        .verify(|signature, signing_string| -> Result<bool, Error> {
-            let public_key = RsaPublicKey::from_public_key_pem(public_key)?;
+        .map_err(|_| Error::ActivitySignatureInvalid)?;
+    if !signature_has_freshness_header(unverified.signing_string()) {
+        return Err(Error::ActivitySignatureInvalid);
+    }
+    let key_id = unverified.key_id().to_string();
+    let verified = unverified.verify(|signature, signing_string| -> Result<bool, Error> {
+        let public_key = RsaPublicKey::from_public_key_pem(public_key)?;
 
-            let base64_decoded = Base64
-                .decode(signature)
-                .map_err(|err| Error::Other(err.to_string()))?;
+        let base64_decoded = Base64
+            .decode(signature)
+            .map_err(|_| Error::ActivitySignatureInvalid)?;
 
-            Ok(public_key
-                .verify(
-                    Pkcs1v15Sign::new::<Sha256>(),
-                    &Sha256::digest(signing_string.as_bytes()),
-                    &base64_decoded,
-                )
-                .is_ok())
-        })?;
+        Ok(public_key
+            .verify(
+                Pkcs1v15Sign::new::<Sha256>(),
+                &Sha256::digest(signing_string.as_bytes()),
+                &base64_decoded,
+            )
+            .is_ok())
+    })?;
 
     if verified {
-        Ok(())
+        Ok(VerifiedSignature { key_id })
     } else {
         Err(ActivitySignatureInvalid)
     }
+}
+
+fn signature_has_freshness_header(signing_string: &str) -> bool {
+    signing_string
+        .lines()
+        .any(|line| line.starts_with("date: ") || line.starts_with("(created): "))
 }
 
 #[allow(dead_code)]
@@ -243,8 +258,8 @@ impl DigestPart {
                     .and_then(|alg| iter.next().map(|value| (alg, value)))
             })
             .map(|(alg, value)| DigestPart {
-                algorithm: alg.to_owned(),
-                digest: value.to_owned(),
+                algorithm: alg.trim().to_owned(),
+                digest: value.trim().to_owned(),
             })
             .collect();
 
@@ -265,16 +280,40 @@ pub(crate) fn verify_body_hash(
     let digest = digest_header
         .and_then(DigestPart::try_from_header)
         .ok_or(Error::ActivityBodyDigestInvalid)?;
-    let mut hasher = Sha256::new();
+    let actual_digest = Base64.encode(Sha256::digest(body));
 
     for part in digest {
-        hasher.update(body);
-        if Base64.encode(hasher.finalize_reset()) != part.digest {
-            return Err(Error::ActivityBodyDigestInvalid);
+        if !part.algorithm.eq_ignore_ascii_case("sha-256") {
+            continue;
+        }
+        if part.digest.trim() == actual_digest {
+            return Ok(());
         }
     }
 
-    Ok(())
+    Err(Error::ActivityBodyDigestInvalid)
+}
+
+pub(crate) fn verify_actor_key_id<A>(actor: &A, key_id: &str) -> Result<(), Error>
+where
+    A: Actor,
+{
+    Url::parse(key_id).map_err(|_| Error::ActivitySignatureInvalid)?;
+
+    if let Some(public_key_id) = actor.public_key_id() {
+        if key_id == public_key_id {
+            return Ok(());
+        }
+        return Err(Error::ActivitySignatureInvalid);
+    }
+
+    let mut key_url = Url::parse(key_id).map_err(|_| Error::ActivitySignatureInvalid)?;
+    key_url.set_fragment(None);
+    if &key_url == actor.id() {
+        Ok(())
+    } else {
+        Err(Error::ActivitySignatureInvalid)
+    }
 }
 
 /// Internal only
@@ -283,7 +322,7 @@ pub(crate) fn verify_body_hash(
 #[allow(missing_docs)]
 pub mod test {
     use super::*;
-    use crate::activity_sending::generate_request_headers;
+    use crate::{activity_sending::generate_request_headers, traits::tests::DB_USER};
     use reqwest::Client;
     use reqwest_middleware::ClientWithMiddleware;
     use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
@@ -293,6 +332,26 @@ pub mod test {
         LazyLock::new(|| Url::parse("https://example.com/u/alice").unwrap());
     static INBOX_URL: LazyLock<Url> =
         LazyLock::new(|| Url::parse("https://example.com/u/alice/inbox").unwrap());
+
+    async fn signed_request(
+        inbox_url: &Url,
+        body: &'static str,
+        http_signature_compat: bool,
+    ) -> Request {
+        let headers = generate_request_headers(inbox_url);
+        let request_builder = ClientWithMiddleware::from(Client::new())
+            .post(inbox_url.to_string())
+            .headers(headers);
+        sign_request(
+            request_builder,
+            &ACTOR_ID,
+            body.into(),
+            RsaPrivateKey::from_pkcs8_pem(&test_keypair().private_key).unwrap(),
+            http_signature_compat,
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn test_sign() {
@@ -360,6 +419,125 @@ pub mod test {
         );
         println!("{:?}", &valid);
         assert!(valid.is_ok());
+    }
+
+    #[test]
+    fn verify_body_hash_accepts_matching_sha256_digest() {
+        let digest_header =
+            HeaderValue::from_static("SHA-256=lzFT+G7C2hdI5j8M+FuJg1tC+O6AGMVJhooTCKGfbKM=");
+        let body = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.";
+
+        let valid = verify_body_hash(Some(&digest_header), body.as_bytes());
+
+        assert_eq!(valid, Ok(()));
+    }
+
+    #[test]
+    fn verify_body_hash_accepts_one_matching_sha256_digest_among_many() {
+        let digest_header = HeaderValue::from_static(
+            "SHA-512=invalid,SHA-256=lzFT+G7C2hdI5j8M+FuJg1tC+O6AGMVJhooTCKGfbKM=",
+        );
+        let body = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.";
+
+        let valid = verify_body_hash(Some(&digest_header), body.as_bytes());
+
+        assert_eq!(valid, Ok(()));
+    }
+
+    #[test]
+    fn verify_body_hash_rejects_sha512_only_digest() {
+        let digest_header = HeaderValue::from_static("SHA-512=not-a-supported-digest");
+
+        let invalid = verify_body_hash(Some(&digest_header), b"body");
+
+        assert_eq!(invalid, Err(Error::ActivityBodyDigestInvalid));
+    }
+
+    #[test]
+    fn verify_body_hash_rejects_mismatched_sha256_digest() {
+        let digest_header =
+            HeaderValue::from_static("SHA-256=Z9h7DJfYWjffXw2XftmWCnpEaK/yqOHKvzCIzIaqgbU=");
+
+        let invalid = verify_body_hash(Some(&digest_header), b"lorem ipsum");
+
+        assert_eq!(invalid, Err(Error::ActivityBodyDigestInvalid));
+    }
+
+    #[tokio::test]
+    async fn verify_signature_returns_key_id() {
+        let request = signed_request(&INBOX_URL, "my activity", false).await;
+
+        let verified = verify_signature(
+            request.headers(),
+            request.method(),
+            &Uri::from_str(request.url().as_str()).unwrap(),
+            &test_keypair().public_key,
+        )
+        .unwrap();
+
+        assert_eq!(verified.key_id, "https://example.com/u/alice#main-key");
+    }
+
+    #[tokio::test]
+    async fn verify_signature_accepts_authorization_signature_header() {
+        let mut request = signed_request(&INBOX_URL, "my activity", false).await;
+        let signature = request.headers_mut().remove("signature").unwrap();
+        let authorization =
+            HeaderValue::from_str(&format!("Signature {}", signature.to_str().unwrap())).unwrap();
+        request.headers_mut().insert("authorization", authorization);
+
+        let verified = verify_signature(
+            request.headers(),
+            request.method(),
+            &Uri::from_str(request.url().as_str()).unwrap(),
+            &test_keypair().public_key,
+        )
+        .unwrap();
+
+        assert_eq!(verified.key_id, "https://example.com/u/alice#main-key");
+    }
+
+    #[tokio::test]
+    async fn signature_verification_fails_for_wrong_request_target() {
+        let request = signed_request(&INBOX_URL, "my activity", true).await;
+        let wrong_uri = Uri::from_static("/api/u/alice/inbox");
+
+        let invalid = verify_signature(
+            request.headers(),
+            request.method(),
+            &wrong_uri,
+            &test_keypair().public_key,
+        );
+
+        assert_eq!(invalid, Err(Error::ActivitySignatureInvalid));
+    }
+
+    #[test]
+    fn actor_key_binding_accepts_fragment_key_id_for_actor() {
+        let actor = DB_USER.clone();
+
+        let valid = verify_actor_key_id(&actor, "https://localhost/123#main-key");
+
+        assert_eq!(valid, Ok(()));
+    }
+
+    #[test]
+    fn actor_key_binding_rejects_other_actor_key_id() {
+        let actor = DB_USER.clone();
+
+        let invalid = verify_actor_key_id(&actor, "https://remote.example/users/bob#main-key");
+
+        assert_eq!(invalid, Err(Error::ActivitySignatureInvalid));
+    }
+
+    #[test]
+    fn actor_key_binding_accepts_exact_public_key_id() {
+        let mut actor = DB_USER.clone();
+        actor.public_key_id = Some("https://localhost/123/keys/main".to_string());
+
+        let valid = verify_actor_key_id(&actor, "https://localhost/123/keys/main");
+
+        assert_eq!(valid, Ok(()));
     }
 
     #[test]

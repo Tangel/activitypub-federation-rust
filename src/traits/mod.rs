@@ -247,6 +247,11 @@ pub trait Actor: Object + Send + 'static {
     /// actor keypair.
     fn public_key_pem(&self) -> &str;
 
+    /// The ActivityPub public key id that belongs to this actor, if persisted by the application.
+    fn public_key_id(&self) -> Option<&str> {
+        None
+    }
+
     /// The actor's private key for signing outgoing activities.
     ///
     /// Use [generate_actor_keypair](crate::http_signatures::generate_actor_keypair) to create the
