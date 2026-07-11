@@ -24,9 +24,67 @@ use std::{
 use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedSender},
     task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 use tracing::{info, warn};
 use url::Url;
+
+/// Read-only, best-effort snapshot of activity queue counters.
+///
+/// Each field is loaded independently with relaxed atomic ordering. The resulting snapshot is
+/// observational rather than atomic or linearizable, so fields can reflect different moments
+/// while workers transition between counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueueSnapshot {
+    /// Activities waiting to be processed by a worker.
+    pub pending: usize,
+    /// Activities currently being processed by a worker.
+    pub running: usize,
+    /// Activities waiting in or running from the retry queue.
+    pub retries: usize,
+    /// Activities which exhausted all retries during the current hour.
+    pub dead_last_hour: usize,
+    /// Activities completed successfully during the current hour.
+    pub completed_last_hour: usize,
+}
+
+impl QueueSnapshot {
+    pub(crate) fn is_idle(self) -> bool {
+        self.pending == 0 && self.running == 0 && self.retries == 0
+    }
+}
+
+/// Result of waiting for the activity queue to become idle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueDrainOutcome {
+    /// The queue became idle before the deadline.
+    Idle(QueueSnapshot),
+    /// The deadline elapsed while work was still active.
+    DeadlineExceeded(QueueSnapshot),
+}
+
+/// Return a read-only snapshot of the activity queue counters.
+///
+/// Counter fields are loaded independently with relaxed ordering, so this is a best-effort,
+/// non-linearizable observation. See [`QueueSnapshot`] for details.
+///
+/// If the queue has not been initialized, this returns an idle default snapshot.
+pub fn activity_queue_snapshot<T: Clone>(data: &Data<T>) -> QueueSnapshot {
+    data.activity_queue_snapshot()
+}
+
+/// Wait until the activity queue is idle or the deadline is reached.
+///
+/// The deadline takes priority over idle state. Idle is returned only after two consecutive idle
+/// snapshots separated by the 25 ms polling interval.
+///
+/// This only observes queue counters and does not stop workers or alter queue state.
+pub async fn wait_for_activity_queue_idle<T: Clone>(
+    data: &Data<T>,
+    deadline: Instant,
+) -> QueueDrainOutcome {
+    data.wait_for_activity_queue_idle(deadline).await
+}
 
 /// Send a new activity to the given inboxes with automatic retry on failure. Alternatively you
 /// can implement your own queue and then send activities using [[crate::activity_sending::SendActivityTask]].
@@ -118,6 +176,18 @@ pub(crate) struct Stats {
     retries: AtomicUsize,
     dead_last_hour: AtomicUsize,
     completed_last_hour: AtomicUsize,
+}
+
+impl Stats {
+    fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            pending: self.pending.load(Ordering::Relaxed),
+            running: self.running.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
+            dead_last_hour: self.dead_last_hour.load(Ordering::Relaxed),
+            completed_last_hour: self.completed_last_hour.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Debug for Stats {
@@ -356,6 +426,10 @@ impl ActivityQueue {
         &self.stats
     }
 
+    pub(crate) fn snapshot(&self) -> QueueSnapshot {
+        self.stats.snapshot()
+    }
+
     #[allow(unused)]
     // Drops all the senders and shuts down the workers
     pub(crate) async fn shutdown(self, wait_for_retries: bool) -> Result<Arc<Stats>, Error> {
@@ -419,12 +493,229 @@ async fn retry<T, E: Display + Debug, F: Future<Output = Result<T, E>>, A: FnMut
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::http_signatures::generate_actor_keypair;
-    use axum::extract::State;
+    use crate::{config::FederationConfig, http_signatures::generate_actor_keypair};
+    use axum::{extract::State, routing::post, Router};
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
     use std::time::Instant;
+    use tokio::{
+        sync::{Notify, Semaphore},
+        time::{timeout, Duration as TokioDuration, Instant as TokioInstant},
+    };
     use tracing::debug;
+
+    async fn observation_data() -> Data<()> {
+        FederationConfig::builder()
+            .domain("example.com")
+            .app_data(())
+            .build()
+            .await
+            .unwrap()
+            .to_request_data()
+    }
+
+    #[derive(Clone)]
+    struct BlockingHandlerState {
+        started: Arc<AtomicUsize>,
+        started_notify: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+
+    async fn blocking_handler(State(state): State<BlockingHandlerState>) {
+        state.started.fetch_add(1, Ordering::Relaxed);
+        state.started_notify.notify_waiters();
+        state.release.acquire().await.unwrap().forget();
+    }
+
+    async fn blocking_test_server() -> (
+        Url,
+        ClientWithMiddleware,
+        BlockingHandlerState,
+        JoinHandle<()>,
+    ) {
+        let state = BlockingHandlerState {
+            started: Arc::new(AtomicUsize::new(0)),
+            started_notify: Arc::new(Notify::new()),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(blocking_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("queue.test", address)
+            .build()
+            .unwrap()
+            .into();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await;
+        });
+
+        (
+            format!("http://queue.test:{}/", address.port())
+                .parse()
+                .unwrap(),
+            client,
+            state,
+            server,
+        )
+    }
+
+    async fn blocking_observation_data(
+        client: ClientWithMiddleware,
+        worker_count: usize,
+    ) -> Data<()> {
+        FederationConfig::builder()
+            .domain("example.com")
+            .app_data(())
+            .client(client)
+            .queue_worker_count(worker_count)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data()
+    }
+
+    async fn wait_for_handler_starts(state: &BlockingHandlerState, expected: usize) {
+        timeout(TokioDuration::from_millis(250), async {
+            loop {
+                let notified = state.started_notify.notified();
+                if state.started.load(Ordering::Relaxed) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn queue_task(inbox: &Url) -> SendActivityTask {
+        let keypair = generate_actor_keypair().unwrap();
+        SendActivityTask {
+            actor_id: inbox.clone(),
+            activity_id: inbox.join("activity").unwrap(),
+            activity: "{}".into(),
+            inbox: inbox.clone(),
+            private_key: keypair.private_key().unwrap(),
+            http_signature_compat: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_snapshot_reports_idle_and_counter_transitions() {
+        let data = observation_data().await;
+        assert_eq!(activity_queue_snapshot(&data), QueueSnapshot::default());
+
+        let queue = data.config.activity_queue.as_ref().unwrap();
+        queue.stats.pending.store(2, Ordering::Relaxed);
+        queue.stats.running.store(3, Ordering::Relaxed);
+        queue.stats.retries.store(4, Ordering::Relaxed);
+        queue.stats.dead_last_hour.store(5, Ordering::Relaxed);
+        queue.stats.completed_last_hour.store(6, Ordering::Relaxed);
+
+        assert_eq!(
+            activity_queue_snapshot(&data),
+            QueueSnapshot {
+                pending: 2,
+                running: 3,
+                retries: 4,
+                dead_last_hour: 5,
+                completed_last_hour: 6,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_queue_idle_requires_stable_initial_idle_observation() {
+        let data = observation_data().await;
+        let started = TokioInstant::now();
+
+        assert_eq!(
+            wait_for_activity_queue_idle(&data, started + TokioDuration::from_millis(100),).await,
+            QueueDrainOutcome::Idle(QueueSnapshot::default())
+        );
+        assert!(started.elapsed() >= TokioDuration::from_millis(25));
+    }
+
+    #[tokio::test]
+    async fn wait_for_queue_idle_prioritizes_an_already_expired_deadline() {
+        let data = observation_data().await;
+
+        assert_eq!(
+            wait_for_activity_queue_idle(
+                &data,
+                TokioInstant::now() - TokioDuration::from_millis(1),
+            )
+            .await,
+            QueueDrainOutcome::DeadlineExceeded(QueueSnapshot::default())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queue_snapshot_observes_real_pending_and_running_work() {
+        let (inbox, client, state, server) = blocking_test_server().await;
+        let data = blocking_observation_data(client, 1).await;
+        let queue = data.config.activity_queue.as_ref().unwrap();
+
+        queue.queue(queue_task(&inbox)).await.unwrap();
+        wait_for_handler_starts(&state, 1).await;
+        assert_eq!(
+            activity_queue_snapshot(&data),
+            QueueSnapshot {
+                running: 1,
+                ..QueueSnapshot::default()
+            }
+        );
+
+        queue.queue(queue_task(&inbox)).await.unwrap();
+        assert_eq!(
+            activity_queue_snapshot(&data),
+            QueueSnapshot {
+                pending: 1,
+                running: 1,
+                ..QueueSnapshot::default()
+            }
+        );
+
+        state.release.add_permits(2);
+        assert!(matches!(
+            wait_for_activity_queue_idle(
+                &data,
+                TokioInstant::now() + TokioDuration::from_millis(500),
+            )
+            .await,
+            QueueDrainOutcome::Idle(_)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_queue_idle_expires_while_real_handler_is_blocked() {
+        let (inbox, client, state, server) = blocking_test_server().await;
+        let data = blocking_observation_data(client, 0).await;
+        let queue = data.config.activity_queue.as_ref().unwrap();
+
+        queue.queue(queue_task(&inbox)).await.unwrap();
+        wait_for_handler_starts(&state, 1).await;
+
+        assert_eq!(
+            wait_for_activity_queue_idle(
+                &data,
+                TokioInstant::now() + TokioDuration::from_millis(30),
+            )
+            .await,
+            QueueDrainOutcome::DeadlineExceeded(QueueSnapshot {
+                running: 1,
+                ..QueueSnapshot::default()
+            })
+        );
+
+        state.release.add_permits(1);
+        server.abort();
+    }
 
     // This will periodically send back internal errors to test the retry
     async fn dodgy_handler(

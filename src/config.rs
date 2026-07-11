@@ -15,7 +15,7 @@
 //! ```
 
 use crate::{
-    activity_queue::{create_activity_queue, ActivityQueue},
+    activity_queue::{create_activity_queue, ActivityQueue, QueueDrainOutcome, QueueSnapshot},
     error::Error,
     http_signatures::sign_request,
     protocol::verification::verify_domains_match,
@@ -27,7 +27,7 @@ use derive_builder::Builder;
 use dyn_clone::{clone_trait_object, DynClone};
 use moka::future::Cache;
 use regex::Regex;
-use reqwest::{redirect::Policy, Client, Request};
+use reqwest::{redirect::Policy, Client, ClientBuilder, Request};
 use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use rsa::{pkcs8::DecodePrivateKey, RsaPrivateKey};
 use serde::de::DeserializeOwned;
@@ -42,7 +42,32 @@ use std::{
     },
     time::Duration,
 };
+use tokio::time::{sleep_until, Instant};
 use url::Url;
+
+const ACTIVITY_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// HTTP client dedicated to exactly-once activity delivery attempts.
+///
+/// It cannot contain middleware and always disables automatic redirects, regardless of the
+/// policy set on the supplied builder.
+#[derive(Clone, Debug)]
+pub struct OneShotClient(ClientWithMiddleware);
+
+impl OneShotClient {
+    /// Build a client that cannot automatically follow redirects or retry through middleware.
+    pub fn from_builder(builder: ClientBuilder) -> Result<Self, reqwest::Error> {
+        builder
+            .redirect(Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map(|client| Self(client.into()))
+    }
+
+    pub(crate) fn client(&self) -> &ClientWithMiddleware {
+        &self.0
+    }
+}
 
 /// Configuration for this library, with various federation related settings
 #[derive(Builder, Clone)]
@@ -51,6 +76,9 @@ pub struct FederationConfig<T: Clone> {
     /// The domain where this federated instance is running
     #[builder(setter(into))]
     pub(crate) domain: String,
+    /// Optional canonical origin for exact local URL authority checks.
+    #[builder(default = "None", setter(strip_option))]
+    pub(crate) local_origin: Option<Url>,
     /// Data which the application requires in handlers, such as database connection
     /// or configuration.
     pub(crate) app_data: T,
@@ -67,6 +95,9 @@ pub struct FederationConfig<T: Clone> {
     /// Instead a single redirect is handled manually. The default client sets a timeout of 10s
     ///  to avoid excessive resource usage when connecting to dead servers.
     pub(crate) client: ClientWithMiddleware,
+    /// Dedicated client for one-shot sends. Redirects are disabled and middleware is not allowed.
+    #[builder(default = "default_one_shot_client()")]
+    pub(crate) one_shot_client: OneShotClient,
     /// Run library in debug mode. This allows usage of http and localhost urls. It also sends
     /// outgoing activities synchronously, not in background thread. This helps to make tests
     /// more consistent. Do not use for production.
@@ -221,6 +252,54 @@ impl<T: Clone> FederationConfig<T> {
     pub fn domain(&self) -> &str {
         &self.domain
     }
+
+    /// Returns the configured canonical local origin, when provided.
+    pub fn local_origin(&self) -> Option<&Url> {
+        self.local_origin.as_ref()
+    }
+
+    /// Return a read-only snapshot of the activity queue counters.
+    ///
+    /// Counter fields are loaded independently with relaxed ordering, so this is a best-effort,
+    /// non-linearizable observation. See [`QueueSnapshot`] for details.
+    ///
+    /// If the queue has not been initialized, this returns an idle default snapshot.
+    pub fn activity_queue_snapshot(&self) -> QueueSnapshot {
+        self.activity_queue
+            .as_deref()
+            .map(ActivityQueue::snapshot)
+            .unwrap_or_default()
+    }
+
+    /// Wait until the activity queue is idle or the deadline is reached.
+    ///
+    /// The deadline takes priority over idle state. Idle is returned only after two consecutive
+    /// idle snapshots separated by the 25 ms polling interval.
+    ///
+    /// This only observes queue counters and does not stop workers or alter queue state.
+    pub async fn wait_for_activity_queue_idle(&self, deadline: Instant) -> QueueDrainOutcome {
+        let mut last_snapshot = self.activity_queue_snapshot();
+        let mut idle_observed = false;
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return QueueDrainOutcome::DeadlineExceeded(last_snapshot);
+            }
+
+            if last_snapshot.is_idle() {
+                if idle_observed {
+                    return QueueDrainOutcome::Idle(last_snapshot);
+                }
+                idle_observed = true;
+            } else {
+                idle_observed = false;
+            }
+
+            sleep_until((now + ACTIVITY_QUEUE_POLL_INTERVAL).min(deadline)).await;
+            last_snapshot = self.activity_queue_snapshot();
+        }
+    }
 }
 
 impl<T: Clone> FederationConfigBuilder<T> {
@@ -348,6 +427,11 @@ impl<T: Clone> Data<T> {
         &self.config.domain
     }
 
+    /// Returns the configured canonical local origin, when provided.
+    pub fn local_origin(&self) -> Option<&Url> {
+        self.config.local_origin()
+    }
+
     /// Returns a new instance of `Data` with request counter set to 0.
     pub fn reset_request_count(&self) -> Self {
         Data {
@@ -358,6 +442,26 @@ impl<T: Clone> Data<T> {
     /// Total number of outgoing HTTP requests made with this data.
     pub fn request_count(&self) -> u32 {
         self.request_counter.0.load(Ordering::Relaxed)
+    }
+
+    /// Return a read-only snapshot of the activity queue counters.
+    ///
+    /// Counter fields are loaded independently with relaxed ordering, so this is a best-effort,
+    /// non-linearizable observation. See [`QueueSnapshot`] for details.
+    ///
+    /// If the queue has not been initialized, this returns an idle default snapshot.
+    pub fn activity_queue_snapshot(&self) -> QueueSnapshot {
+        self.config.activity_queue_snapshot()
+    }
+
+    /// Wait until the activity queue is idle or the deadline is reached.
+    ///
+    /// The deadline takes priority over idle state. Idle is returned only after two consecutive
+    /// idle snapshots separated by the 25 ms polling interval.
+    ///
+    /// This only observes queue counters and does not stop workers or alter queue state.
+    pub async fn wait_for_activity_queue_idle(&self, deadline: Instant) -> QueueDrainOutcome {
+        self.config.wait_for_activity_queue_idle(deadline).await
     }
 
     /// Add HTTP signature to arbitrary request
@@ -429,6 +533,12 @@ fn default_client() -> ClientWithMiddleware {
         .into()
 }
 
+fn default_one_shot_client() -> OneShotClient {
+    let timeout = Duration::from_secs(10);
+    OneShotClient::from_builder(Client::builder().timeout(timeout).connect_timeout(timeout))
+        .unwrap_or_else(|error| panic!("failed to build one-shot HTTP client: {error}"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod test {
@@ -457,5 +567,20 @@ mod test {
     async fn test_get_domain() {
         let config = config().await;
         assert_eq!("example.com", config.domain());
+    }
+
+    #[tokio::test]
+    async fn config_exposes_explicit_local_origin() {
+        let origin = Url::parse("https://example.com:8443").unwrap();
+        let config = FederationConfig::builder()
+            .domain("example.com")
+            .local_origin(origin.clone())
+            .app_data(1)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        assert_eq!(config.local_origin(), Some(&origin));
     }
 }

@@ -23,48 +23,22 @@ pub(crate) mod reqwest_shim;
 pub mod traits;
 mod utils;
 
-use crate::{
-    config::Data,
-    error::Error,
-    fetch::object_id::ObjectId,
-    traits::{Activity, Actor, Object},
+pub use activity_queue::{
+    activity_queue_snapshot,
+    wait_for_activity_queue_idle,
+    QueueDrainOutcome,
+    QueueSnapshot,
 };
 pub use activitystreams_kinds as kinds;
 
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::Deserialize;
 use url::Url;
 
 /// Mime type for Activitypub data, used for `Accept` and `Content-Type` HTTP headers
 pub const FEDERATION_CONTENT_TYPE: &str = "application/activity+json";
 
-/// Deserialize incoming inbox activity to the given type, perform basic
-/// validation and extract the actor.
-async fn parse_received_activity<A, ActorT, Datatype>(
-    body: &[u8],
-    data: &Data<Datatype>,
-) -> Result<(A, ActorT), <A as Activity>::Error>
-where
-    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
-    ActorT: Object<DataType = Datatype> + Actor + Send + Sync + 'static,
-    for<'de2> <ActorT as Object>::Kind: serde::Deserialize<'de2>,
-    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
-    <ActorT as Object>::Error: From<Error>,
-    Datatype: Clone,
-{
-    let activity: A = sonic_rs::from_slice(body).map_err(|err| {
-        // Attempt to include activity id in error message
-        let id = extract_id(body).ok();
-        Error::ParseReceivedActivity { err, id }
-    })?;
-    data.config.verify_url_and_domain(&activity).await?;
-    let actor = ObjectId::<ActorT>::from(activity.actor().clone())
-        .dereference(data)
-        .await?;
-    Ok((activity, actor))
-}
-
 /// Attempt to parse id field from serialized json
-fn extract_id(data: &[u8]) -> sonic_rs::Result<Url> {
+pub(crate) fn extract_id(data: &[u8]) -> sonic_rs::Result<Url> {
     #[derive(Deserialize)]
     struct Id {
         id: Url,

@@ -49,6 +49,7 @@ pub struct DbUser {
     pub federation_id: Url,
     pub inbox: Url,
     pub public_key: String,
+    pub public_key_id: Option<String>,
     #[allow(dead_code)]
     private_key: Option<String>,
     pub followers: Vec<Url>,
@@ -62,6 +63,7 @@ pub static DB_USER: LazyLock<DbUser> = LazyLock::new(|| DbUser {
     federation_id: "https://localhost/123".parse().unwrap(),
     inbox: "https://localhost/123/inbox".parse().unwrap(),
     public_key: DB_USER_KEYPAIR.public_key.clone(),
+    public_key_id: None,
     private_key: Some(DB_USER_KEYPAIR.private_key.clone()),
     followers: vec![],
     local: false,
@@ -111,6 +113,7 @@ impl Object for DbUser {
             federation_id: json.id.into(),
             inbox: json.inbox,
             public_key: json.public_key.public_key_pem,
+            public_key_id: None,
             private_key: None,
             followers: vec![],
             local: false,
@@ -121,6 +124,10 @@ impl Object for DbUser {
 impl Actor for DbUser {
     fn public_key_pem(&self) -> &str {
         &self.public_key
+    }
+
+    fn public_key_id(&self) -> Option<&str> {
+        self.public_key_id.as_deref()
     }
 
     fn private_key_pem(&self) -> Option<String> {
