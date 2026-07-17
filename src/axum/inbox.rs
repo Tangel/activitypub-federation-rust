@@ -230,7 +230,7 @@ where
 
 /// Contains all data that is necessary to receive an activity from an HTTP request
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ActivityData {
     headers: HeaderMap,
     method: Method,
@@ -753,6 +753,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(data.app_data().receive_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn replayable_activity_data_supports_two_complete_verifications_without_receiving() {
+        let data = test_data(ACTOR_ID, false).await;
+        let activity_data = signed_activity_data(activity_body()).await;
+
+        let first =
+            verify_activity::<TestActivity, TestActor, TestState>(activity_data.clone(), &data)
+                .await
+                .unwrap();
+        let second = verify_activity::<TestActivity, TestActor, TestState>(activity_data, &data)
+            .await
+            .unwrap();
+
+        assert_eq!(first.body, second.body);
+        assert_eq!(first.activity_id, second.activity_id);
+        assert_eq!(first.actor_id, second.actor_id);
+        assert_eq!(first.key_id, second.key_id);
+        assert_eq!(data.app_data().receive_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
