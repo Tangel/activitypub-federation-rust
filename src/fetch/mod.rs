@@ -55,6 +55,10 @@ impl ConditionalRequestValidators {
             last_modified: last_modified.map(parse_conditional_validator).transpose()?,
         })
     }
+
+    fn has_conditional_headers(&self) -> bool {
+        self.etag.is_some() || self.last_modified.is_some()
+    }
 }
 
 fn parse_conditional_validator(value: &str) -> Result<HeaderValue, Error> {
@@ -153,7 +157,7 @@ impl ConditionalFetchMode<'_> {
     }
 
     fn accepts_not_modified(&self) -> bool {
-        matches!(self, Self::Conditional(_))
+        matches!(self, Self::Conditional(validators) if validators.has_conditional_headers())
     }
 }
 
@@ -328,9 +332,17 @@ async fn fetch_object_http_response<T: Clone>(
         req.send().await?
     };
 
-    // Allow a single redirect using recursion. Further redirects are ignored.
+    // Allow a single explicit redirect using recursion. Further redirects are ignored.
+    let is_supported_redirect = matches!(
+        res.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    );
     let location = res.headers().get(LOCATION).and_then(|l| l.to_str().ok());
-    if let (Some(location), false) = (location, recursive) {
+    if let (Some(location), false, true) = (location, recursive, is_supported_redirect) {
         let location = location.parse()?;
         return Box::pin(fetch_object_http_response(
             &location,
@@ -545,6 +557,15 @@ mod tests {
                 "{this is intentionally not json",
             )
                 .into_response(),
+            "/not-modified-with-location" => {
+                let location = request_url.join("/location-target").unwrap().to_string();
+                (
+                    StatusCode::NOT_MODIFIED,
+                    [("location", location), ("etag", "\"actor-v3\"".to_string())],
+                    "{this is intentionally not json",
+                )
+                    .into_response()
+            }
             "/redirect" => {
                 let location = request_url.join("/final").unwrap().to_string();
                 (StatusCode::FOUND, [("location", location)]).into_response()
@@ -560,6 +581,21 @@ mod tests {
             )
                 .into_response(),
             "/gone" => (StatusCode::GONE, "{this is intentionally not json").into_response(),
+            "/gone-with-location" => {
+                let location = request_url.join("/location-target").unwrap().to_string();
+                (
+                    StatusCode::GONE,
+                    [("location", location)],
+                    "{this is intentionally not json",
+                )
+                    .into_response()
+            }
+            "/location-target" => (
+                StatusCode::OK,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                format!(r#"{{"id":"{request_url}"}}"#),
+            )
+                .into_response(),
             "/wrong-content-type" => (
                 StatusCode::OK,
                 [("content-type", "text/html")],
@@ -590,6 +626,18 @@ mod tests {
                 format!(r#"{{"id":"{request_url}"}}"#),
             )
                 .into_response(),
+            "/server-error-with-location" => {
+                let location = request_url.join("/location-target").unwrap().to_string();
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [
+                        ("location", location),
+                        ("content-type", crate::FEDERATION_CONTENT_TYPE.to_string()),
+                    ],
+                    format!(r#"{{"id":"{request_url}"}}"#),
+                )
+                    .into_response()
+            }
             "/oversized" => (
                 StatusCode::OK,
                 [("content-type", crate::FEDERATION_CONTENT_TYPE)],
@@ -664,6 +712,162 @@ mod tests {
         assert!(ConditionalRequestValidators::try_new(None, Some("bad\tvalue")).is_err());
         assert!(ConditionalRequestValidators::try_new(Some(&"x".repeat(513)), None).is_err());
         assert!(ConditionalRequestValidators::try_new(Some(&"x".repeat(512)), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_rejects_not_modified_without_sent_validators() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/not-modified"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Other(_)));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].headers.contains_key(IF_NONE_MATCH));
+        assert!(!requests[0].headers.contains_key(IF_MODIFIED_SINCE));
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_does_not_follow_location_on_server_error() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/server-error-with-location"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Reqwest(_)));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/server-error-with-location"]
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_does_not_follow_location_on_not_modified() -> Result<(), Error> {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let url = server.url("/not-modified-with-location");
+        let validators = ConditionalRequestValidators::try_new(Some("\"actor-v2\""), None)?;
+
+        let outcome =
+            fetch_object_http_conditional::<_, TestActorKind>(&url, validators, &data).await?;
+        let ConditionalFetchOutcome::NotModified { final_url, .. } = outcome else {
+            panic!("304 with Location must remain a not-modified response");
+        };
+
+        assert_eq!(final_url, url);
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/not-modified-with-location"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_does_not_follow_location_on_gone() -> Result<(), Error> {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let url = server.url("/gone-with-location");
+
+        let outcome = fetch_object_http_conditional::<_, TestActorKind>(
+            &url,
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await?;
+        let ConditionalFetchOutcome::Gone { final_url } = outcome else {
+            panic!("410 with Location must remain a gone response");
+        };
+
+        assert_eq!(final_url, url);
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/gone-with-location"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normal_fetch_does_not_follow_location_on_gone() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let url = server.url("/gone-with-location");
+
+        let error = match fetch_object_http::<_, TestActorKind>(&url, &data).await {
+            Ok(_) => panic!("410 with Location must remain an object-deleted response"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, Error::ObjectDeleted(url));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/gone-with-location"]
+        );
     }
 
     #[tokio::test]
