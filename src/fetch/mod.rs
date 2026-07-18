@@ -134,30 +134,70 @@ pub async fn fetch_object_http_conditional<T: Clone, Kind: DeserializeOwned>(
     validators: ConditionalRequestValidators,
     data: &Data<T>,
 ) -> Result<ConditionalFetchOutcome<Kind>, Error> {
+    fetch_object_http_conditional_inner(url, ConditionalFetchMode::Conditional(&validators), data)
+        .await
+}
+
+#[derive(Clone, Copy)]
+enum ConditionalFetchMode<'a> {
+    Conditional(&'a ConditionalRequestValidators),
+    CanonicalRefetch,
+}
+
+impl ConditionalFetchMode<'_> {
+    fn validators(&self) -> Option<&ConditionalRequestValidators> {
+        match self {
+            Self::Conditional(validators) => Some(validators),
+            Self::CanonicalRefetch => None,
+        }
+    }
+
+    fn accepts_not_modified(&self) -> bool {
+        matches!(self, Self::Conditional(_))
+    }
+}
+
+async fn fetch_object_http_conditional_inner<T: Clone, Kind: DeserializeOwned>(
+    url: &Url,
+    mode: ConditionalFetchMode<'_>,
+    data: &Data<T>,
+) -> Result<ConditionalFetchOutcome<Kind>, Error> {
     static FETCH_CONTENT_TYPE: HeaderValue = HeaderValue::from_static(FEDERATION_CONTENT_TYPE);
     let response =
-        fetch_object_http_response(url, data, &FETCH_CONTENT_TYPE, Some(&validators), false)
+        fetch_object_http_response(url, data, &FETCH_CONTENT_TYPE, mode.validators(), false)
             .await?;
     let final_url = response.url().clone();
 
-    if response.status() == StatusCode::NOT_MODIFIED {
-        validate_final_remote_url(&final_url, data)?;
-        return Ok(ConditionalFetchOutcome::NotModified {
-            final_url,
-            etag: response_header_value(response.headers().get(ETAG)),
-            last_modified: response_header_value(response.headers().get(LAST_MODIFIED)),
-        });
-    }
-    if response.status() == StatusCode::GONE {
-        validate_final_remote_url(&final_url, data)?;
-        return Ok(ConditionalFetchOutcome::Gone { final_url });
+    match response.status() {
+        StatusCode::OK => {}
+        StatusCode::NOT_MODIFIED => {
+            validate_final_remote_url(&final_url, data)?;
+            if !mode.accepts_not_modified() {
+                return Err(unexpected_response_status(&response));
+            }
+            return Ok(ConditionalFetchOutcome::NotModified {
+                final_url,
+                etag: response_header_value(response.headers().get(ETAG)),
+                last_modified: response_header_value(response.headers().get(LAST_MODIFIED)),
+            });
+        }
+        StatusCode::GONE => {
+            validate_final_remote_url(&final_url, data)?;
+            return Ok(ConditionalFetchOutcome::Gone { final_url });
+        }
+        _ => return Err(unexpected_response_status(&response)),
     }
 
     let etag = response_header_value(response.headers().get(ETAG));
     let last_modified = response_header_value(response.headers().get(LAST_MODIFIED));
     let res = parse_fetch_object_response(response).await?;
     if let Some(object_id) = validate_activitypub_response(&res, data).await? {
-        return Box::pin(fetch_object_http_conditional(&object_id, validators, data)).await;
+        return Box::pin(fetch_object_http_conditional_inner(
+            &object_id,
+            ConditionalFetchMode::CanonicalRefetch,
+            data,
+        ))
+        .await;
     }
 
     Ok(ConditionalFetchOutcome::Modified {
@@ -172,6 +212,16 @@ fn response_header_value(value: Option<&HeaderValue>) -> Option<String> {
     value
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+fn unexpected_response_status(response: &reqwest::Response) -> Error {
+    match response.error_for_status_ref() {
+        Ok(_) => Error::Other(format!(
+            "unexpected object fetch status {}",
+            response.status()
+        )),
+        Err(error) => error.into(),
+    }
 }
 
 async fn validate_activitypub_response<T: Clone, Kind>(
@@ -225,7 +275,9 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
 ) -> Result<FetchObjectResponse<Kind>, Error> {
     let response = fetch_object_http_response(url, data, content_type, None, recursive).await?;
     if response.status() == StatusCode::GONE {
-        return Err(Error::ObjectDeleted(response.url().clone()));
+        let final_url = response.url().clone();
+        validate_final_remote_url(&final_url, data)?;
+        return Err(Error::ObjectDeleted(final_url));
     }
     parse_fetch_object_response(response).await
 }
@@ -423,6 +475,70 @@ mod tests {
         });
 
         match path.as_str() {
+            "/alias" => (
+                StatusCode::OK,
+                [
+                    ("content-type", crate::FEDERATION_CONTENT_TYPE),
+                    ("etag", "\"alias-v2\""),
+                    ("last-modified", LAST_MODIFIED),
+                ],
+                format!(r#"{{"id":"{}"}}"#, request_url.join("/canonical").unwrap()),
+            )
+                .into_response(),
+            "/canonical" => {
+                if request.headers().get(IF_NONE_MATCH)
+                    == Some(&HeaderValue::from_static("\"alias-v1\""))
+                    || request.headers().get(IF_MODIFIED_SINCE)
+                        == Some(&HeaderValue::from_static(LAST_MODIFIED))
+                {
+                    (
+                        StatusCode::NOT_MODIFIED,
+                        [("etag", "\"canonical-v1\"")],
+                        "{this is intentionally not json",
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        [
+                            ("content-type", crate::FEDERATION_CONTENT_TYPE),
+                            ("etag", "\"canonical-v1\""),
+                        ],
+                        format!(r#"{{"id":"{request_url}"}}"#),
+                    )
+                        .into_response()
+                }
+            }
+            "/alias-to-always-not-modified" => (
+                StatusCode::OK,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                format!(
+                    r#"{{"id":"{}"}}"#,
+                    request_url.join("/canonical-always-not-modified").unwrap()
+                ),
+            )
+                .into_response(),
+            "/alias-to-canonical-wrong-id" => (
+                StatusCode::OK,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                format!(
+                    r#"{{"id":"{}"}}"#,
+                    request_url.join("/canonical-wrong-id").unwrap()
+                ),
+            )
+                .into_response(),
+            "/canonical-wrong-id" => (
+                StatusCode::OK,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                r#"{"id":"https://other.example/canonical"}"#,
+            )
+                .into_response(),
+            "/canonical-always-not-modified" => (
+                StatusCode::NOT_MODIFIED,
+                [("etag", "\"canonical-v1\"")],
+                "{this is intentionally not json",
+            )
+                .into_response(),
             "/not-modified" => (
                 StatusCode::NOT_MODIFIED,
                 [("etag", "\"actor-v3\""), ("last-modified", LAST_MODIFIED)],
@@ -454,6 +570,24 @@ mod tests {
                 StatusCode::OK,
                 [("content-type", crate::FEDERATION_CONTENT_TYPE)],
                 r#"{"id":"https://other.example/actor"}"#,
+            )
+                .into_response(),
+            "/not-found-valid" => (
+                StatusCode::NOT_FOUND,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                format!(r#"{{"id":"{request_url}"}}"#),
+            )
+                .into_response(),
+            "/redirect-without-location-valid" => (
+                StatusCode::FOUND,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                format!(r#"{{"id":"{request_url}"}}"#),
+            )
+                .into_response(),
+            "/server-error-valid" => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                format!(r#"{{"id":"{request_url}"}}"#),
             )
                 .into_response(),
             "/oversized" => (
@@ -530,6 +664,220 @@ mod tests {
         assert!(ConditionalRequestValidators::try_new(None, Some("bad\tvalue")).is_err());
         assert!(ConditionalRequestValidators::try_new(Some(&"x".repeat(513)), None).is_err());
         assert!(ConditionalRequestValidators::try_new(Some(&"x".repeat(512)), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_canonical_refetch_clears_alias_validators_and_validates_body(
+    ) -> Result<(), Error> {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let validators =
+            ConditionalRequestValidators::try_new(Some("\"alias-v1\""), Some(LAST_MODIFIED))?;
+        let canonical_url = server.url("/canonical");
+
+        let outcome = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/alias"),
+            validators,
+            &data,
+        )
+        .await?;
+        let ConditionalFetchOutcome::Modified {
+            object,
+            final_url,
+            etag,
+            ..
+        } = outcome
+        else {
+            panic!("canonical refetch must return a verified modified object");
+        };
+
+        assert_eq!(object.id, canonical_url);
+        assert_eq!(final_url, canonical_url);
+        assert_eq!(etag.as_deref(), Some("\"canonical-v1\""));
+        let requests = server.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/alias", "/canonical"]
+        );
+        assert_eq!(
+            requests[0].headers.get(IF_NONE_MATCH).unwrap(),
+            "\"alias-v1\""
+        );
+        assert_eq!(
+            requests[0].headers.get(IF_MODIFIED_SINCE).unwrap(),
+            LAST_MODIFIED
+        );
+        assert!(!requests[1].headers.contains_key(IF_NONE_MATCH));
+        assert!(!requests[1].headers.contains_key(IF_MODIFIED_SINCE));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_canonical_refetch_rejects_unconditional_not_modified() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/alias-to-always-not-modified"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_canonical_refetch_enforces_exact_id() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/alias-to-canonical-wrong-id"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::FetchWrongId(_)));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/alias-to-canonical-wrong-id", "/canonical-wrong-id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_rejects_shaped_error_status_404() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/not-found-valid"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Reqwest(_)));
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_rejects_shaped_error_status_302_without_location() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/redirect-without-location-valid"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_rejects_shaped_error_status_500() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/server-error-valid"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Reqwest(_)));
+    }
+
+    #[tokio::test]
+    async fn normal_and_conditional_fetch_reject_local_gone_before_status_mapping() {
+        let server = FetchFixture::spawn().await;
+        let local_domain = format!(
+            "{}:{}",
+            server.base_url.host_str().unwrap(),
+            server.base_url.port().unwrap()
+        );
+        let data = FederationConfig::builder()
+            .domain(local_domain)
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let gone_url = server.url("/gone");
+
+        let conditional_error = fetch_object_http_conditional::<_, TestActorKind>(
+            &gone_url,
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conditional_error, Error::NotFound);
+
+        let normal_error = match fetch_object_http::<_, TestActorKind>(&gone_url, &data).await {
+            Ok(_) => panic!("normal fetch must reject a local gone response"),
+            Err(error) => error,
+        };
+        assert_eq!(normal_error, Error::NotFound);
     }
 
     #[tokio::test]
