@@ -11,11 +11,17 @@ use crate::{
     FEDERATION_CONTENT_TYPE,
 };
 use bytes::Bytes;
-use http::{header::LOCATION, HeaderValue, StatusCode};
+use http::{
+    header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION},
+    HeaderValue,
+    StatusCode,
+};
 use serde::de::DeserializeOwned;
 use std::sync::atomic::Ordering;
 use tracing::info;
 use url::Url;
+
+const MAX_CONDITIONAL_VALIDATOR_LENGTH: usize = 512;
 
 /// Typed wrapper for collection IDs
 pub mod collection_id;
@@ -32,6 +38,65 @@ pub struct FetchObjectResponse<Kind> {
     pub url: Url,
     content_type: Option<HeaderValue>,
     object_id: Option<Url>,
+}
+
+/// Validators supplied with a conditional ActivityPub fetch.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConditionalRequestValidators {
+    etag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
+}
+
+impl ConditionalRequestValidators {
+    /// Construct validated conditional request headers.
+    pub fn try_new(etag: Option<&str>, last_modified: Option<&str>) -> Result<Self, Error> {
+        Ok(Self {
+            etag: etag.map(parse_conditional_validator).transpose()?,
+            last_modified: last_modified.map(parse_conditional_validator).transpose()?,
+        })
+    }
+}
+
+fn parse_conditional_validator(value: &str) -> Result<HeaderValue, Error> {
+    if value.chars().count() > MAX_CONDITIONAL_VALIDATOR_LENGTH
+        || value.chars().any(char::is_control)
+    {
+        return Err(Error::Other(
+            "invalid conditional request validator".to_string(),
+        ));
+    }
+    HeaderValue::from_str(value)
+        .map_err(|_| Error::Other("invalid conditional request validator".to_string()))
+}
+
+/// Closed result of a conditional ActivityPub fetch.
+#[derive(Debug)]
+pub enum ConditionalFetchOutcome<Kind> {
+    /// The remote object changed and was parsed successfully.
+    Modified {
+        /// Parsed remote object.
+        object: Kind,
+        /// Final URL after the optional validated redirect.
+        final_url: Url,
+        /// Response ETag, when present and valid UTF-8.
+        etag: Option<String>,
+        /// Response Last-Modified value, when present and valid UTF-8.
+        last_modified: Option<String>,
+    },
+    /// The remote server returned 304 without requiring body parsing.
+    NotModified {
+        /// Final URL after the optional validated redirect.
+        final_url: Url,
+        /// Response ETag, when present and valid UTF-8.
+        etag: Option<String>,
+        /// Response Last-Modified value, when present and valid UTF-8.
+        last_modified: Option<String>,
+    },
+    /// The remote server returned 410 Gone.
+    Gone {
+        /// Final URL after the optional validated redirect.
+        final_url: Url,
+    },
 }
 
 /// Fetch a remote object over HTTP and convert to `Kind`.
@@ -54,44 +119,100 @@ pub async fn fetch_object_http<T: Clone, Kind: DeserializeOwned>(
     data: &Data<T>,
 ) -> Result<FetchObjectResponse<Kind>, Error> {
     static FETCH_CONTENT_TYPE: HeaderValue = HeaderValue::from_static(FEDERATION_CONTENT_TYPE);
-    const VALID_RESPONSE_CONTENT_TYPES: [&str; 3] = [
-        FEDERATION_CONTENT_TYPE, // lemmy
-        r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#, // activitypub standard
-        r#"application/activity+json; charset=utf-8"#,                             // mastodon
-    ];
     let res = fetch_object_http_with_accept(url, data, &FETCH_CONTENT_TYPE, false).await?;
-
-    // Ensure correct content-type to prevent vulnerabilities, with case insensitive comparison.
-    let content_type = res
-        .content_type
-        .as_ref()
-        .and_then(|c| Some(c.to_str().ok()?.to_lowercase()))
-        .ok_or(Error::FetchInvalidContentType(res.url.clone()))?;
-    if !VALID_RESPONSE_CONTENT_TYPES.contains(&content_type.as_str()) {
-        return Err(Error::FetchInvalidContentType(res.url));
-    }
-
-    // Ensure id field matches final url after redirect
-    if res.object_id.as_ref() != Some(&res.url) {
-        if let Some(res_object_id) = res.object_id {
-            data.config.verify_url_valid(&res_object_id).await?;
-            // If id is different but still on the same domain, attempt to request object
-            // again from url in id field.
-            if res_object_id.domain() == res.url.domain() {
-                return Box::pin(fetch_object_http(&res_object_id, data)).await;
-            }
-        }
-        // Failed to fetch the object from its specified id
-        return Err(Error::FetchWrongId(res.url));
-    }
-
-    // Dont allow fetching local object. Only check this after the request as a local url
-    // may redirect to a remote object.
-    if data.config.is_local_url(&res.url) {
-        return Err(Error::NotFound);
+    if let Some(object_id) = validate_activitypub_response(&res, data).await? {
+        return Box::pin(fetch_object_http(&object_id, data)).await;
     }
 
     Ok(res)
+}
+
+/// Fetch an ActivityPub object with optional cache validators through the same security path as
+/// [`fetch_object_http`].
+pub async fn fetch_object_http_conditional<T: Clone, Kind: DeserializeOwned>(
+    url: &Url,
+    validators: ConditionalRequestValidators,
+    data: &Data<T>,
+) -> Result<ConditionalFetchOutcome<Kind>, Error> {
+    static FETCH_CONTENT_TYPE: HeaderValue = HeaderValue::from_static(FEDERATION_CONTENT_TYPE);
+    let response =
+        fetch_object_http_response(url, data, &FETCH_CONTENT_TYPE, Some(&validators), false)
+            .await?;
+    let final_url = response.url().clone();
+
+    if response.status() == StatusCode::NOT_MODIFIED {
+        validate_final_remote_url(&final_url, data)?;
+        return Ok(ConditionalFetchOutcome::NotModified {
+            final_url,
+            etag: response_header_value(response.headers().get(ETAG)),
+            last_modified: response_header_value(response.headers().get(LAST_MODIFIED)),
+        });
+    }
+    if response.status() == StatusCode::GONE {
+        validate_final_remote_url(&final_url, data)?;
+        return Ok(ConditionalFetchOutcome::Gone { final_url });
+    }
+
+    let etag = response_header_value(response.headers().get(ETAG));
+    let last_modified = response_header_value(response.headers().get(LAST_MODIFIED));
+    let res = parse_fetch_object_response(response).await?;
+    if let Some(object_id) = validate_activitypub_response(&res, data).await? {
+        return Box::pin(fetch_object_http_conditional(&object_id, validators, data)).await;
+    }
+
+    Ok(ConditionalFetchOutcome::Modified {
+        object: res.object,
+        final_url: res.url,
+        etag,
+        last_modified,
+    })
+}
+
+fn response_header_value(value: Option<&HeaderValue>) -> Option<String> {
+    value
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+async fn validate_activitypub_response<T: Clone, Kind>(
+    res: &FetchObjectResponse<Kind>,
+    data: &Data<T>,
+) -> Result<Option<Url>, Error> {
+    const VALID_RESPONSE_CONTENT_TYPES: [&str; 3] = [
+        FEDERATION_CONTENT_TYPE,
+        r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#,
+        r#"application/activity+json; charset=utf-8"#,
+    ];
+
+    let content_type = res
+        .content_type
+        .as_ref()
+        .and_then(|content_type| Some(content_type.to_str().ok()?.to_lowercase()))
+        .ok_or_else(|| Error::FetchInvalidContentType(res.url.clone()))?;
+    if !VALID_RESPONSE_CONTENT_TYPES.contains(&content_type.as_str()) {
+        return Err(Error::FetchInvalidContentType(res.url.clone()));
+    }
+
+    if res.object_id.as_ref() != Some(&res.url) {
+        if let Some(res_object_id) = &res.object_id {
+            data.config.verify_url_valid(res_object_id).await?;
+            if res_object_id.domain() == res.url.domain() {
+                return Ok(Some(res_object_id.clone()));
+            }
+        }
+        return Err(Error::FetchWrongId(res.url.clone()));
+    }
+
+    validate_final_remote_url(&res.url, data)?;
+
+    Ok(None)
+}
+
+fn validate_final_remote_url<T: Clone>(url: &Url, data: &Data<T>) -> Result<(), Error> {
+    if data.config.is_local_url(url) {
+        return Err(Error::NotFound);
+    }
+    Ok(())
 }
 
 /// Fetch a remote object over HTTP and convert to `Kind`. This function works exactly as
@@ -102,6 +223,20 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
     content_type: &HeaderValue,
     recursive: bool,
 ) -> Result<FetchObjectResponse<Kind>, Error> {
+    let response = fetch_object_http_response(url, data, content_type, None, recursive).await?;
+    if response.status() == StatusCode::GONE {
+        return Err(Error::ObjectDeleted(response.url().clone()));
+    }
+    parse_fetch_object_response(response).await
+}
+
+async fn fetch_object_http_response<T: Clone>(
+    url: &Url,
+    data: &Data<T>,
+    content_type: &HeaderValue,
+    validators: Option<&ConditionalRequestValidators>,
+    recursive: bool,
+) -> Result<reqwest::Response, Error> {
     let config = &data.config;
     config.verify_url_valid(url).await?;
     info!("Fetching remote object {}", url.to_string());
@@ -113,11 +248,19 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
         return Err(Error::RequestLimit);
     }
 
-    let req = config
+    let mut req = config
         .client
         .get(url.as_str())
         .header("Accept", content_type)
         .timeout(config.request_timeout);
+    if let Some(validators) = validators {
+        if let Some(etag) = &validators.etag {
+            req = req.header(IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = &validators.last_modified {
+            req = req.header(IF_MODIFIED_SINCE, last_modified);
+        }
+    }
 
     let res = if let Some((actor_id, private_key_pem)) = config.signed_fetch_actor.as_deref() {
         let req = sign_request(
@@ -137,22 +280,25 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
     let location = res.headers().get(LOCATION).and_then(|l| l.to_str().ok());
     if let (Some(location), false) = (location, recursive) {
         let location = location.parse()?;
-        return Box::pin(fetch_object_http_with_accept(
+        return Box::pin(fetch_object_http_response(
             &location,
             data,
             content_type,
+            validators,
             true,
         ))
         .await;
     }
 
-    if res.status() == StatusCode::GONE {
-        return Err(Error::ObjectDeleted(url.clone()));
-    }
+    Ok(res)
+}
 
-    let url = res.url().clone();
-    let content_type = res.headers().get("Content-Type").cloned();
-    let text = res.bytes_limited().await?;
+async fn parse_fetch_object_response<Kind: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<FetchObjectResponse<Kind>, Error> {
+    let url = response.url().clone();
+    let content_type = response.headers().get("Content-Type").cloned();
+    let text = response.bytes_limited().await?;
     let object_id = extract_id(&text).ok();
 
     match sonic_rs::from_slice(&text) {
@@ -175,9 +321,187 @@ async fn fetch_object_http_with_accept<T: Clone, Kind: DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::{
-        config::FederationConfig,
-        traits::tests::{DbConnection, Person},
+        config::{FederationConfig, UrlVerifier},
+        traits::tests::{DbConnection, Person, DB_USER},
     };
+    use axum::{
+        body::Body,
+        extract::State,
+        http::Request,
+        response::{IntoResponse, Response},
+        Router,
+    };
+    use http::{
+        header::{HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH},
+        HeaderMap,
+        Uri,
+    };
+    use serde::Deserialize;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::task::JoinHandle;
+
+    const LAST_MODIFIED: &str = "Sat, 18 Jul 2026 00:00:00 GMT";
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestActorKind {
+        id: Url,
+    }
+
+    #[derive(Clone)]
+    struct RecordedRequest {
+        path: String,
+        headers: HeaderMap,
+    }
+
+    #[derive(Clone, Default)]
+    struct FetchFixtureState {
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    struct FetchFixture {
+        base_url: Url,
+        state: FetchFixtureState,
+        task: JoinHandle<()>,
+    }
+
+    impl FetchFixture {
+        async fn spawn() -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = FetchFixtureState::default();
+            let app = Router::new()
+                .fallback(fetch_fixture_handler)
+                .with_state(state.clone());
+            let task = tokio::spawn(async move {
+                let never = axum::serve(listener, app).await;
+                match never {}
+            });
+
+            Self {
+                base_url: Url::parse(&format!("http://localhost:{}", address.port())).unwrap(),
+                state,
+                task,
+            }
+        }
+
+        fn url(&self, path: &str) -> Url {
+            self.base_url.join(path).unwrap()
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.state.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FetchFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn fixture_request_url(headers: &HeaderMap, uri: &Uri) -> Url {
+        let host = headers.get(HOST).unwrap().to_str().unwrap();
+        Url::parse(&format!("http://{host}{}", uri.path())).unwrap()
+    }
+
+    async fn fetch_fixture_handler(
+        State(state): State<FetchFixtureState>,
+        request: Request<Body>,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let request_url = fixture_request_url(request.headers(), request.uri());
+        state.requests.lock().unwrap().push(RecordedRequest {
+            path: path.clone(),
+            headers: request.headers().clone(),
+        });
+
+        match path.as_str() {
+            "/not-modified" => (
+                StatusCode::NOT_MODIFIED,
+                [("etag", "\"actor-v3\""), ("last-modified", LAST_MODIFIED)],
+                "{this is intentionally not json",
+            )
+                .into_response(),
+            "/redirect" => {
+                let location = request_url.join("/final").unwrap().to_string();
+                (StatusCode::FOUND, [("location", location)]).into_response()
+            }
+            "/final" => (
+                StatusCode::OK,
+                [
+                    ("content-type", crate::FEDERATION_CONTENT_TYPE),
+                    ("etag", "\"actor-v3\""),
+                    ("last-modified", LAST_MODIFIED),
+                ],
+                format!(r#"{{"id":"{request_url}"}}"#),
+            )
+                .into_response(),
+            "/gone" => (StatusCode::GONE, "{this is intentionally not json").into_response(),
+            "/wrong-content-type" => (
+                StatusCode::OK,
+                [("content-type", "text/html")],
+                format!(r#"{{"id":"{request_url}"}}"#),
+            )
+                .into_response(),
+            "/wrong-id" => (
+                StatusCode::OK,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                r#"{"id":"https://other.example/actor"}"#,
+            )
+                .into_response(),
+            "/oversized" => (
+                StatusCode::OK,
+                [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                vec![b'x'; 1024 * 1024 + 1],
+            )
+                .into_response(),
+            "/slow" => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                (
+                    StatusCode::OK,
+                    [("content-type", crate::FEDERATION_CONTENT_TYPE)],
+                    format!(r#"{{"id":"{request_url}"}}"#),
+                )
+                    .into_response()
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingUrlVerifier {
+        urls: Arc<Mutex<Vec<Url>>>,
+    }
+
+    impl UrlVerifier for RecordingUrlVerifier {
+        fn verify(
+            &self,
+            url: &Url,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+            self.urls.lock().unwrap().push(url.clone());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RejectingUrlVerifier;
+
+    impl UrlVerifier for RejectingUrlVerifier {
+        fn verify(
+            &self,
+            url: &Url,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+            let domain = url.domain().unwrap_or_default().to_string();
+            Box::pin(async move { Err(Error::DomainResolveError(domain)) })
+        }
+    }
 
     #[tokio::test]
     async fn test_request_limit() -> Result<(), Error> {
@@ -196,6 +520,279 @@ mod tests {
             fetch_object_http(&Url::parse(&fetch_url).map_err(Error::UrlParse)?, &data).await;
 
         assert_eq!(res.err(), Some(Error::RequestLimit));
+
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_fetch_validators_reject_controls_and_values_over_512_bytes() {
+        assert!(ConditionalRequestValidators::try_new(Some("bad\nvalue"), None).is_err());
+        assert!(ConditionalRequestValidators::try_new(None, Some("bad\tvalue")).is_err());
+        assert!(ConditionalRequestValidators::try_new(Some(&"x".repeat(513)), None).is_err());
+        assert!(ConditionalRequestValidators::try_new(Some(&"x".repeat(512)), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_reuses_headers_signing_redirect_and_closed_outcomes(
+    ) -> Result<(), Error> {
+        let server = FetchFixture::spawn().await;
+        let verified_urls = Arc::new(Mutex::new(Vec::new()));
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .url_verifier(Box::new(RecordingUrlVerifier {
+                urls: verified_urls.clone(),
+            }))
+            .signed_fetch_actor(&*DB_USER)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let validators =
+            ConditionalRequestValidators::try_new(Some("\"actor-v2\""), Some(LAST_MODIFIED))?;
+
+        let not_modified_url = server.url("/not-modified");
+        let not_modified = fetch_object_http_conditional::<_, TestActorKind>(
+            &not_modified_url,
+            validators.clone(),
+            &data,
+        )
+        .await?;
+        let ConditionalFetchOutcome::NotModified {
+            final_url,
+            etag,
+            last_modified,
+        } = not_modified
+        else {
+            panic!("expected not-modified outcome");
+        };
+        assert_eq!(final_url, not_modified_url);
+        assert_eq!(etag.as_deref(), Some("\"actor-v3\""));
+        assert_eq!(last_modified.as_deref(), Some(LAST_MODIFIED));
+
+        let redirect_url = server.url("/redirect");
+        let final_url = server.url("/final");
+        let modified = fetch_object_http_conditional::<_, TestActorKind>(
+            &redirect_url,
+            validators.clone(),
+            &data,
+        )
+        .await?;
+        let ConditionalFetchOutcome::Modified {
+            object,
+            final_url: modified_final_url,
+            etag,
+            last_modified,
+        } = modified
+        else {
+            panic!("expected modified outcome");
+        };
+        assert_eq!(object.id, final_url);
+        assert_eq!(modified_final_url, final_url);
+        assert_eq!(etag.as_deref(), Some("\"actor-v3\""));
+        assert_eq!(last_modified.as_deref(), Some(LAST_MODIFIED));
+
+        let gone_url = server.url("/gone");
+        let gone =
+            fetch_object_http_conditional::<_, TestActorKind>(&gone_url, validators, &data).await?;
+        let ConditionalFetchOutcome::Gone {
+            final_url: gone_final_url,
+        } = gone
+        else {
+            panic!("expected gone outcome");
+        };
+        assert_eq!(gone_final_url, gone_url);
+
+        assert_eq!(data.request_count(), 4);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/not-modified", "/redirect", "/final", "/gone"]
+        );
+        for request in &requests {
+            assert_eq!(request.headers.get(IF_NONE_MATCH).unwrap(), "\"actor-v2\"");
+            assert_eq!(
+                request.headers.get(IF_MODIFIED_SINCE).unwrap(),
+                LAST_MODIFIED
+            );
+            assert!(request.headers.contains_key("signature"));
+        }
+        assert_eq!(
+            verified_urls.lock().unwrap().as_slice(),
+            [not_modified_url, redirect_url, final_url, gone_url]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_enforces_content_type_and_exact_final_id() {
+        let server = FetchFixture::spawn().await;
+        let data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let content_type_error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/wrong-content-type"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            content_type_error,
+            Error::FetchInvalidContentType(_)
+        ));
+
+        let wrong_id_error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/wrong-id"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(wrong_id_error, Error::FetchWrongId(_)));
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_rejects_local_final_url_before_closed_outcome() {
+        let server = FetchFixture::spawn().await;
+        let local_domain = format!(
+            "{}:{}",
+            server.base_url.host_str().unwrap(),
+            server.base_url.port().unwrap()
+        );
+        let data = FederationConfig::builder()
+            .domain(local_domain)
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+
+        let error = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/not-modified"),
+            ConditionalRequestValidators::default(),
+            &data,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, Error::NotFound);
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_runs_url_dns_ip_safety_before_request() -> Result<(), Error> {
+        let rejected_data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .url_verifier(Box::new(RejectingUrlVerifier))
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let rejected = fetch_object_http_conditional::<_, TestActorKind>(
+            &Url::parse("https://blocked.example/actor")?,
+            ConditionalRequestValidators::default(),
+            &rejected_data,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(rejected, Error::DomainResolveError(_)));
+        assert_eq!(rejected_data.request_count(), 0);
+
+        let ip_data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .allow_http_urls(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let rejected_ip = fetch_object_http_conditional::<_, TestActorKind>(
+            &Url::parse("http://127.0.0.1/actor")?,
+            ConditionalRequestValidators::default(),
+            &ip_data,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(rejected_ip, Error::UrlVerificationError(_)));
+        assert_eq!(ip_data.request_count(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_enforces_request_limit_timeout_and_body_bound() -> Result<(), Error>
+    {
+        let limited_data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .http_fetch_limit(0)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let limited = fetch_object_http_conditional::<_, TestActorKind>(
+            &Url::parse("https://remote.example/actor")?,
+            ConditionalRequestValidators::default(),
+            &limited_data,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(limited, Error::RequestLimit);
+
+        let server = FetchFixture::spawn().await;
+        let timed_data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .request_timeout(Duration::from_millis(20))
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let timeout = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/slow"),
+            ConditionalRequestValidators::default(),
+            &timed_data,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            timeout,
+            Error::ReqwestMiddleware(_) | Error::Reqwest(_)
+        ));
+
+        let bounded_data = FederationConfig::builder()
+            .domain("local.example")
+            .app_data(())
+            .debug(true)
+            .build()
+            .await
+            .unwrap()
+            .to_request_data();
+        let oversized = fetch_object_http_conditional::<_, TestActorKind>(
+            &server.url("/oversized"),
+            ConditionalRequestValidators::default(),
+            &bounded_data,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized, Error::ResponseBodyLimit);
 
         Ok(())
     }

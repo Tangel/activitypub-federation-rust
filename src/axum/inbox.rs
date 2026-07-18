@@ -18,7 +18,7 @@ use axum::{
 };
 use http::{HeaderMap, Method, Uri};
 use serde::de::DeserializeOwned;
-use std::error::Error as StdError;
+use std::{error::Error as StdError, future::Future, pin::Pin};
 use url::Url;
 
 const INBOX_BODY_LIMIT: usize = 1024 * 1024;
@@ -75,6 +75,20 @@ pub struct VerifiedActivity<A, ActorT> {
     pub activity_id: Url,
 }
 
+/// Resolves the Actor declared by an incoming activity.
+pub trait ActorResolver<ActorT, Datatype>: Send + Sync
+where
+    ActorT: Object<DataType = Datatype>,
+    Datatype: Clone,
+{
+    /// Resolve `actor_id` without caching verification results between calls.
+    fn resolve<'a>(
+        &'a self,
+        actor_id: &'a Url,
+        data: &'a Data<Datatype>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActorT, ActorT::Error>> + Send + 'a>>;
+}
+
 /// Verifies an incoming activity without invoking [`Activity::receive`].
 pub async fn verify_activity<A, ActorT, Datatype>(
     activity_data: ActivityData,
@@ -88,14 +102,47 @@ where
     <ActorT as Object>::Error: From<Error> + StdError + 'static,
     Datatype: Clone,
 {
-    verify_activity_core(activity_data, data, |source: &<ActorT as Object>::Error| {
-        classify_actor_fetch_failure(source as &(dyn StdError + 'static))
-    })
+    verify_activity_with_object_id(
+        &activity_data,
+        data,
+        |source: &<ActorT as Object>::Error| {
+            classify_actor_fetch_failure(source as &(dyn StdError + 'static))
+        },
+    )
     .await
 }
 
-async fn verify_activity_core<A, ActorT, Datatype, ClassifyActorFetchFailure>(
-    activity_data: ActivityData,
+/// Verifies an incoming activity through `resolver` without consuming the request data.
+///
+/// Each call repeats protocol, Actor, signature, key-owner and business verification. It never
+/// invokes [`Activity::receive`].
+pub async fn verify_activity_with_actor_resolver<A, ActorT, Datatype>(
+    activity_data: &ActivityData,
+    data: &Data<Datatype>,
+    resolver: &dyn ActorResolver<ActorT, Datatype>,
+) -> Result<VerifiedActivity<A, ActorT>, VerificationFailure<<A as Activity>::Error>>
+where
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    ActorT: Object<DataType = Datatype> + Actor + Send + Sync + 'static,
+    <A as Activity>::Error: From<Error> + From<<ActorT as Object>::Error>,
+    <ActorT as Object>::Error: StdError + 'static,
+    Datatype: Clone,
+{
+    let parsed = parse_activity_data(activity_data, data).await?;
+    let actor = resolver
+        .resolve(&parsed.actor_id, data)
+        .await
+        .map_err(|source| VerificationFailure {
+            class: classify_actor_fetch_failure(&source as &(dyn StdError + 'static)),
+            actor_id: Some(parsed.actor_id.clone()),
+            key_id: None,
+            source: source.into(),
+        })?;
+    verify_post_resolution(activity_data, data, parsed, actor).await
+}
+
+async fn verify_activity_with_object_id<A, ActorT, Datatype, ClassifyActorFetchFailure>(
+    activity_data: &ActivityData,
     data: &Data<Datatype>,
     classify_actor_fetch_failure: ClassifyActorFetchFailure,
 ) -> Result<VerifiedActivity<A, ActorT>, VerificationFailure<<A as Activity>::Error>>
@@ -108,22 +155,48 @@ where
     Datatype: Clone,
     ClassifyActorFetchFailure: FnOnce(&<ActorT as Object>::Error) -> VerificationFailureClass,
 {
-    let ActivityData {
-        headers,
-        method,
-        uri,
-        body,
-    } = activity_data;
-    let activity: A = sonic_rs::from_slice(&body).map_err(|err| VerificationFailure {
-        class: VerificationFailureClass::MalformedInput,
-        actor_id: None,
-        key_id: None,
-        source: Error::ParseReceivedActivity {
-            err,
-            id: extract_id(&body).ok(),
-        }
-        .into(),
-    })?;
+    let parsed = parse_activity_data(activity_data, data).await?;
+    let actor = ObjectId::<ActorT>::from(parsed.actor_id.clone())
+        .dereference(data)
+        .await
+        .map_err(|source| {
+            let class = classify_actor_fetch_failure(&source);
+            VerificationFailure {
+                class,
+                actor_id: Some(parsed.actor_id.clone()),
+                key_id: None,
+                source: source.into(),
+            }
+        })?;
+    verify_post_resolution(activity_data, data, parsed, actor).await
+}
+
+struct ParsedActivity<A> {
+    activity: A,
+    activity_id: Url,
+    actor_id: Url,
+}
+
+async fn parse_activity_data<A, Datatype>(
+    activity_data: &ActivityData,
+    data: &Data<Datatype>,
+) -> Result<ParsedActivity<A>, VerificationFailure<<A as Activity>::Error>>
+where
+    A: Activity<DataType = Datatype> + DeserializeOwned + Send + 'static,
+    <A as Activity>::Error: From<Error>,
+    Datatype: Clone,
+{
+    let activity: A =
+        sonic_rs::from_slice(&activity_data.body).map_err(|err| VerificationFailure {
+            class: VerificationFailureClass::MalformedInput,
+            actor_id: None,
+            key_id: None,
+            source: Error::ParseReceivedActivity {
+                err,
+                id: extract_id(&activity_data.body).ok(),
+            }
+            .into(),
+        })?;
     let activity_id = activity.id().clone();
     let actor_id = activity.actor().clone();
 
@@ -137,33 +210,52 @@ where
             source: source.into(),
         })?;
 
-    let actor = ObjectId::<ActorT>::from(actor_id.clone())
-        .dereference(data)
-        .await
-        .map_err(|source| {
-            let class = classify_actor_fetch_failure(&source);
-            VerificationFailure {
-                class,
-                actor_id: Some(actor_id.clone()),
-                key_id: None,
-                source: source.into(),
-            }
-        })?;
+    Ok(ParsedActivity {
+        activity,
+        activity_id,
+        actor_id,
+    })
+}
 
-    verify_body_hash(headers.get("digest"), &body).map_err(|source| VerificationFailure {
-        class: VerificationFailureClass::Digest,
-        actor_id: Some(actor_id.clone()),
-        key_id: None,
-        source: source.into(),
-    })?;
+async fn verify_post_resolution<A, ActorT, Datatype>(
+    activity_data: &ActivityData,
+    data: &Data<Datatype>,
+    parsed: ParsedActivity<A>,
+    actor: ActorT,
+) -> Result<VerifiedActivity<A, ActorT>, VerificationFailure<<A as Activity>::Error>>
+where
+    A: Activity<DataType = Datatype>,
+    ActorT: Object<DataType = Datatype> + Actor,
+    <A as Activity>::Error: From<Error>,
+    Datatype: Clone,
+{
+    let ParsedActivity {
+        activity,
+        activity_id,
+        actor_id,
+    } = parsed;
 
-    let verified_signature = verify_signature(&headers, &method, &uri, actor.public_key_pem())
-        .map_err(|failure| VerificationFailure {
-            class: VerificationFailureClass::Signature,
+    verify_body_hash(activity_data.headers.get("digest"), &activity_data.body).map_err(
+        |source| VerificationFailure {
+            class: VerificationFailureClass::Digest,
             actor_id: Some(actor_id.clone()),
-            key_id: failure.key_id,
-            source: failure.source.into(),
-        })?;
+            key_id: None,
+            source: source.into(),
+        },
+    )?;
+
+    let verified_signature = verify_signature(
+        &activity_data.headers,
+        &activity_data.method,
+        &activity_data.uri,
+        actor.public_key_pem(),
+    )
+    .map_err(|failure| VerificationFailure {
+        class: VerificationFailureClass::Signature,
+        actor_id: Some(actor_id.clone()),
+        key_id: failure.key_id,
+        source: failure.source.into(),
+    })?;
 
     verify_actor_key_id(&actor, &verified_signature.key_id).map_err(|source| {
         VerificationFailure {
@@ -189,7 +281,7 @@ where
         actor,
         actor_id,
         key_id: verified_signature.key_id,
-        body,
+        body: activity_data.body.clone(),
         activity_id,
     })
 }
@@ -219,11 +311,12 @@ where
     <ActorT as Object>::Error: From<Error>,
     Datatype: Clone,
 {
-    let verified = verify_activity_core::<A, ActorT, Datatype, _>(activity_data, data, |_| {
-        VerificationFailureClass::ActorFetch
-    })
-    .await
-    .map_err(|failure| failure.source)?;
+    let verified =
+        verify_activity_with_object_id::<A, ActorT, Datatype, _>(&activity_data, data, |_| {
+            VerificationFailureClass::ActorFetch
+        })
+        .await
+        .map_err(|failure| failure.source)?;
     verified.activity.receive(data).await?;
     Ok(())
 }
@@ -294,17 +387,20 @@ fn is_body_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
         receive_activity,
         verify_activity,
+        verify_activity_with_actor_resolver,
         ActivityData,
+        ActorResolver,
         VerificationFailureClass,
         INBOX_BODY_LIMIT,
     };
     use crate::{
         activity_sending::generate_request_headers,
-        config::{Data, FederationConfig},
+        config::{Data, FederationConfig, UrlVerifier},
         error::Error,
         http_signatures::{sign_request, test::test_keypair},
         traits::{Activity, Actor, Object},
@@ -321,10 +417,13 @@ mod tests {
     use rsa::{pkcs8::DecodePrivateKey, RsaPrivateKey};
     use serde::{Deserialize, Serialize};
     use std::{
+        future::Future,
+        pin::Pin,
         str::FromStr,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
+            Mutex,
         },
     };
     use url::Url;
@@ -338,7 +437,27 @@ mod tests {
         actor: TestActor,
         actor_fetch_failure: Option<ActorFetchFailure>,
         reject_business_verify: bool,
+        business_verify_calls: Arc<AtomicUsize>,
         receive_calls: Arc<AtomicUsize>,
+        url_verify_calls: Arc<AtomicUsize>,
+        verified_urls: Arc<Mutex<Vec<Url>>>,
+    }
+
+    #[derive(Clone)]
+    struct CountingUrlVerifier {
+        calls: Arc<AtomicUsize>,
+        urls: Arc<Mutex<Vec<Url>>>,
+    }
+
+    impl UrlVerifier for CountingUrlVerifier {
+        fn verify(
+            &self,
+            url: &Url,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.urls.lock().unwrap().push(url.clone());
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -445,6 +564,47 @@ mod tests {
         }
     }
 
+    struct CountingActorResolver {
+        actor: Mutex<TestActor>,
+        actor_ids: Mutex<Vec<Url>>,
+        calls: AtomicUsize,
+    }
+
+    impl CountingActorResolver {
+        fn new(actor: TestActor) -> Self {
+            Self {
+                actor: Mutex::new(actor),
+                actor_ids: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn actor_ids(&self) -> Vec<Url> {
+            self.actor_ids.lock().unwrap().clone()
+        }
+
+        fn replace_actor(&self, actor: TestActor) {
+            *self.actor.lock().unwrap() = actor;
+        }
+    }
+
+    impl ActorResolver<TestActor, TestState> for CountingActorResolver {
+        fn resolve<'a>(
+            &'a self,
+            actor_id: &'a Url,
+            _data: &'a Data<TestState>,
+        ) -> Pin<Box<dyn Future<Output = Result<TestActor, TestError>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.actor_ids.lock().unwrap().push(actor_id.clone());
+            let actor = self.actor.lock().unwrap().clone();
+            Box::pin(async move { Ok(actor) })
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct LegacyActor(TestActor);
 
@@ -524,6 +684,9 @@ mod tests {
         }
 
         async fn verify(&self, data: &Data<Self::DataType>) -> Result<(), Self::Error> {
+            data.app_data()
+                .business_verify_calls
+                .fetch_add(1, Ordering::SeqCst);
             if data.app_data().reject_business_verify {
                 return Err(TestError::BusinessVerification);
             }
@@ -556,11 +719,19 @@ mod tests {
             },
             actor_fetch_failure,
             reject_business_verify,
+            business_verify_calls: Arc::new(AtomicUsize::new(0)),
             receive_calls: Arc::new(AtomicUsize::new(0)),
+            url_verify_calls: Arc::new(AtomicUsize::new(0)),
+            verified_urls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let url_verifier = CountingUrlVerifier {
+            calls: state.url_verify_calls.clone(),
+            urls: state.verified_urls.clone(),
         };
         FederationConfig::builder()
             .domain("local.example")
             .app_data(state)
+            .url_verifier(Box::new(url_verifier))
             .debug(true)
             .build()
             .await
@@ -593,6 +764,137 @@ mod tests {
 
     fn request_with_body_size(size: usize) -> Request<Body> {
         Request::new(Body::from(vec![0; size]))
+    }
+
+    fn tamper_signature(activity_data: &mut ActivityData) {
+        let signature = activity_data.headers.get("signature").unwrap().as_bytes();
+        let mut tampered = signature.to_vec();
+        let signature_value_start = signature
+            .windows(b"signature=\"".len())
+            .position(|window| window == b"signature=\"")
+            .unwrap()
+            + b"signature=\"".len();
+        tampered[signature_value_start] = if tampered[signature_value_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        activity_data
+            .headers
+            .insert("signature", HeaderValue::from_bytes(&tampered).unwrap());
+    }
+
+    #[tokio::test]
+    async fn replayable_verification_runs_resolver_url_and_business_checks_twice() {
+        let data = test_data(ACTOR_ID, false).await;
+        let request = signed_activity_data(activity_body()).await;
+        let resolver = CountingActorResolver::new(data.app_data().actor.clone());
+
+        let first = verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap();
+        let second = verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.activity_id, second.activity_id);
+        assert_eq!(resolver.calls(), 2);
+        assert_eq!(
+            resolver.actor_ids(),
+            vec![Url::parse(ACTOR_ID).unwrap(), Url::parse(ACTOR_ID).unwrap()]
+        );
+        assert_eq!(data.app_data().url_verify_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            data.app_data().verified_urls.lock().unwrap().as_slice(),
+            [
+                Url::parse(ACTIVITY_ID).unwrap(),
+                Url::parse(ACTIVITY_ID).unwrap()
+            ]
+        );
+        assert_eq!(
+            data.app_data().business_verify_calls.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(data.app_data().receive_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn replayable_verification_rechecks_digest_on_second_run() {
+        let data = test_data(ACTOR_ID, false).await;
+        let mut request = signed_activity_data(activity_body()).await;
+        let resolver = CountingActorResolver::new(data.app_data().actor.clone());
+
+        verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap();
+        request.headers.insert(
+            "digest",
+            HeaderValue::from_static("SHA-256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        );
+
+        let failure = verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.class, VerificationFailureClass::Digest);
+        assert_eq!(resolver.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn replayable_verification_rechecks_signature_on_second_run() {
+        let data = test_data(ACTOR_ID, false).await;
+        let mut request = signed_activity_data(activity_body()).await;
+        let resolver = CountingActorResolver::new(data.app_data().actor.clone());
+
+        verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap();
+        tamper_signature(&mut request);
+
+        let failure = verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.class, VerificationFailureClass::Signature);
+        assert_eq!(resolver.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn replayable_verification_rechecks_actor_key_owner_on_second_run() {
+        let data = test_data(ACTOR_ID, false).await;
+        let request = signed_activity_data(activity_body()).await;
+        let resolver = CountingActorResolver::new(data.app_data().actor.clone());
+
+        verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap();
+        resolver.replace_actor(TestActor {
+            id: Url::parse("https://example.com/u/bob").unwrap(),
+            public_key: data.app_data().actor.public_key.clone(),
+        });
+
+        let failure = verify_activity_with_actor_resolver::<TestActivity, TestActor, TestState>(
+            &request, &data, &resolver,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.class, VerificationFailureClass::ActorKeyMismatch);
+        assert_eq!(resolver.calls(), 2);
     }
 
     #[tokio::test]
